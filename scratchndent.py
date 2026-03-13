@@ -14,10 +14,9 @@ the defects.
 """
 
 import argparse
-import shutil
-import subprocess
+import struct
 import sys
-import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import cv2
@@ -404,68 +403,391 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
     return result
 
 
-def invert_with_darktable(
-    input_path: str,
-    output_path: str,
-    xmp_path: str,
-) -> None:
-    """Convert a negative to positive using darktable-cli with a sidecar XMP.
+MIDDLE_GREY = 0.1845
 
-    The XMP sidecar contains a full darktable processing history (negadoctor,
-    sigmoid, channel mixer, etc.) tuned for a specific scanner + film stock
-    combination. This gives much better results than a generic algorithmic
-    inversion.
+# CIE CAT16 forward matrix (RGB/XYZ to LMS)
+M_CAT16 = np.array([
+    [ 0.401288,  0.650173, -0.051461],
+    [-0.250268,  1.204414,  0.045854],
+    [-0.002079,  0.048952,  0.953127],
+])
+M_CAT16_INV = np.linalg.inv(M_CAT16)
 
-    darktable-cli applies the processing pipeline and exports to TIFF.
+# D50 reference white point (darktable's pipeline white)
+D50_xy = (0.3457, 0.3585)
+
+
+def _xy_to_XYZ(x: float, y: float) -> np.ndarray:
+    """Convert CIE xy chromaticity to XYZ with Y=1."""
+    return np.array([x / y, 1.0, (1.0 - x - y) / y])
+
+
+def compute_cat16_matrix(scene_x: float, scene_y: float) -> np.ndarray:
+    """Compute a CAT16 chromatic adaptation matrix from scene illuminant to D50."""
+    scene_XYZ = _xy_to_XYZ(scene_x, scene_y)
+    d50_XYZ = _xy_to_XYZ(*D50_xy)
+
+    scene_lms = M_CAT16 @ scene_XYZ
+    d50_lms = M_CAT16 @ d50_XYZ
+
+    gains = d50_lms / scene_lms
+    return M_CAT16_INV @ np.diag(gains) @ M_CAT16
+
+
+def extract_channelmixer_from_xmp(xmp_path: str) -> np.ndarray | None:
+    """Extract chromatic adaptation matrix from the last enabled channelmixerrgb.
+
+    Decodes the scene illuminant chromaticity and computes the CAT16 adaptation
+    matrix to D50.
     """
-    dt = shutil.which("darktable-cli")
-    if dt is None:
-        sys.exit("darktable-cli not found in PATH. Install darktable or add "
-                 "it to your shell.nix.")
+    tree = ET.parse(xmp_path)
+    root = tree.getroot()
+    ns = {"rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+          "darktable": "http://darktable.sf.net/"}
 
-    if not Path(xmp_path).exists():
-        sys.exit(f"XMP sidecar not found: {xmp_path}")
+    last_params = None
+    for li in root.iter(f"{{{ns['rdf']}}}li"):
+        op = li.get(f"{{{ns['darktable']}}}operation")
+        enabled = li.get(f"{{{ns['darktable']}}}enabled")
+        if op == "channelmixerrgb" and enabled == "1":
+            last_params = li.get(f"{{{ns['darktable']}}}params")
 
-    # darktable-cli expects the XMP next to the input file, or passed via
-    # --xmp flag. We copy it next to a temp input to avoid polluting the
-    # original location.
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_input = Path(tmpdir) / "input.tif"
-        tmp_xmp = Path(tmpdir) / "input.tif.xmp"
-        out_dir = Path(tmpdir) / "out"
-        out_dir.mkdir()
+    if last_params is None:
+        return None
 
-        # Symlink the input to avoid copying a ~1GB file
-        tmp_input.symlink_to(Path(input_path).resolve())
-        shutil.copy2(xmp_path, tmp_xmp)
+    # Decompress gz-prefixed params
+    import base64, zlib
+    prefix_len = 4  # 'gz' + 2-char version
+    b64_data = last_params[prefix_len:]
+    padding = 4 - len(b64_data) % 4
+    if padding != 4:
+        b64_data += "=" * padding
+    data = zlib.decompress(base64.b64decode(b64_data))
 
-        cmd = [
-            dt,
-            str(tmp_input),
-            str(tmp_xmp),
-            str(out_dir),
-            "--out-ext", "tif",
-            "--core",
-            "--library", ":memory:",
-            "--configdir", str(tmpdir),
-        ]
-        print(f"  Running: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
+    # Extract x, y chromaticity at float offsets 34, 35
+    n_floats = len(data) // 4
+    values = struct.unpack(f"<{n_floats}f", data[:n_floats * 4])
+    scene_x = values[34]
+    scene_y = values[35]
+    temperature = values[36]
+
+    print(f"  Channel mixer: scene illuminant xy=({scene_x:.4f}, {scene_y:.4f}) "
+          f"T={temperature:.0f}K → adapting to D50")
+
+    return compute_cat16_matrix(scene_x, scene_y)
+
+
+def apply_chromatic_adaptation(img: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Apply a 3x3 chromatic adaptation matrix to a linear RGB image."""
+    h, w, _ = img.shape
+    flat = img.reshape(-1, 3)
+    adapted = (matrix @ flat.T).T
+    return adapted.reshape(h, w, 3)
+
+
+def parse_sigmoid_params(params_hex: str) -> dict:
+    """Decode sigmoid binary params from XMP hex string."""
+    data = bytes.fromhex(params_hex)
+    fmt = "<ff ff i f ff ff ff f i"
+    v = struct.unpack(fmt, data)
+    return {
+        "middle_grey_contrast": float(v[0]),
+        "contrast_skewness": float(v[1]),
+        "display_white_target": float(v[2]) * 0.01,
+        "display_black_target": float(v[3]) * 0.01,
+        "color_processing": int(v[4]),
+        "hue_preservation": min(max(float(v[5]) * 0.01, 0.0), 1.0),
+    }
+
+
+def extract_sigmoid_from_xmp(xmp_path: str) -> dict | None:
+    """Extract the last enabled sigmoid params from a darktable XMP sidecar."""
+    tree = ET.parse(xmp_path)
+    root = tree.getroot()
+    ns = {"rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+          "darktable": "http://darktable.sf.net/"}
+
+    last_params = None
+    for li in root.iter(f"{{{ns['rdf']}}}li"):
+        op = li.get(f"{{{ns['darktable']}}}operation")
+        enabled = li.get(f"{{{ns['darktable']}}}enabled")
+        if op == "sigmoid" and enabled == "1":
+            last_params = li.get(f"{{{ns['darktable']}}}params")
+
+    if last_params is None:
+        return None
+    return parse_sigmoid_params(last_params)
+
+
+def _generalized_loglogistic_sigmoid(
+    value: np.ndarray,
+    magnitude: float,
+    paper_exp: float,
+    film_fog: float,
+    film_power: float,
+    paper_power: float,
+) -> np.ndarray:
+    """Attempt the generalized log-logistic sigmoid from darktable."""
+    clamped = np.maximum(value, 0.0)
+    film_response = np.power(film_fog + clamped, film_power)
+    paper_response = magnitude * np.power(
+        film_response / (paper_exp + film_response), paper_power
+    )
+    return np.where(np.isnan(paper_response), magnitude, paper_response)
+
+
+def sigmoid_commit_params(params: dict) -> dict:
+    """Replicate darktable's sigmoid commit_params to derive internal constants."""
+    ref_film_power = params["middle_grey_contrast"]
+    ref_paper_power = 1.0
+    ref_magnitude = 1.0
+    ref_film_fog = 0.0
+    ref_paper_exposure = (
+        (ref_film_fog + MIDDLE_GREY) ** ref_film_power
+        * ((ref_magnitude / MIDDLE_GREY) - 1.0)
+    )
+
+    delta = 1e-6
+    ref_slope = (
+        _generalized_loglogistic_sigmoid(
+            np.array([MIDDLE_GREY + delta]), ref_magnitude,
+            ref_paper_exposure, ref_film_fog, ref_film_power, ref_paper_power
+        )[0]
+        - _generalized_loglogistic_sigmoid(
+            np.array([MIDDLE_GREY - delta]), ref_magnitude,
+            ref_paper_exposure, ref_film_fog, ref_film_power, ref_paper_power
+        )[0]
+    ) / (2.0 * delta)
+
+    paper_power = 5.0 ** (-params["contrast_skewness"])
+    white_target = params["display_white_target"]
+    black_target = params["display_black_target"]
+
+    temp_film_power = 1.0
+    temp_white_grey_relation = (
+        (white_target / MIDDLE_GREY) ** (1.0 / paper_power) - 1.0
+    )
+    temp_paper_exposure = MIDDLE_GREY ** temp_film_power * temp_white_grey_relation
+    temp_slope = (
+        _generalized_loglogistic_sigmoid(
+            np.array([MIDDLE_GREY + delta]), white_target,
+            temp_paper_exposure, ref_film_fog, temp_film_power, paper_power
+        )[0]
+        - _generalized_loglogistic_sigmoid(
+            np.array([MIDDLE_GREY - delta]), white_target,
+            temp_paper_exposure, ref_film_fog, temp_film_power, paper_power
+        )[0]
+    ) / (2.0 * delta)
+
+    film_power = ref_slope / temp_slope
+
+    white_grey_relation = (
+        (white_target / MIDDLE_GREY) ** (1.0 / paper_power) - 1.0
+    )
+    white_black_relation = (
+        (black_target / white_target) ** (-1.0 / paper_power) - 1.0
+    )
+
+    film_fog = (
+        MIDDLE_GREY * white_grey_relation ** (1.0 / film_power)
+        / (white_black_relation ** (1.0 / film_power)
+           - white_grey_relation ** (1.0 / film_power))
+    )
+    paper_exposure = (
+        (film_fog + MIDDLE_GREY) ** film_power * white_grey_relation
+    )
+
+    return {
+        "white_target": white_target,
+        "black_target": black_target,
+        "paper_exposure": paper_exposure,
+        "film_fog": film_fog,
+        "film_power": film_power,
+        "paper_power": paper_power,
+    }
+
+
+def apply_sigmoid(img: np.ndarray, params: dict) -> np.ndarray:
+    """Apply darktable's sigmoid tone mapping (per-channel mode).
+
+    Maps scene-referred linear values to display-referred [0, white_target].
+    """
+    d = sigmoid_commit_params(params)
+
+    print(f"  Sigmoid internals: film_power={d['film_power']:.4f} "
+          f"paper_power={d['paper_power']:.4f} film_fog={d['film_fog']:.6f} "
+          f"paper_exp={d['paper_exposure']:.6f}")
+
+    result = np.empty_like(img)
+    for c in range(3):
+        result[:, :, c] = _generalized_loglogistic_sigmoid(
+            img[:, :, c],
+            d["white_target"],
+            d["paper_exposure"],
+            d["film_fog"],
+            d["film_power"],
+            d["paper_power"],
         )
 
-        if result.returncode != 0:
-            print(f"  darktable-cli stderr:\n{result.stderr}", file=sys.stderr)
-            sys.exit(f"darktable-cli failed with exit code {result.returncode}")
+    return result
 
-        # darktable writes to out_dir with the input filename
-        outputs = list(out_dir.glob("*.tif"))
-        if not outputs:
-            sys.exit("darktable-cli did not produce output")
 
-        shutil.move(str(outputs[0]), output_path)
+def srgb_to_linear(img: np.ndarray) -> np.ndarray:
+    """Convert sRGB gamma-encoded values to linear light."""
+    linear = np.where(
+        img <= 0.04045,
+        img / 12.92,
+        np.power((img + 0.055) / 1.055, 2.4),
+    )
+    return linear
+
+
+def linear_to_srgb(img: np.ndarray) -> np.ndarray:
+    """Convert linear light values to sRGB gamma-encoded."""
+    srgb = np.where(
+        img <= 0.0031308,
+        img * 12.92,
+        1.055 * np.power(np.maximum(img, 0), 1.0 / 2.4) - 0.055,
+    )
+    return srgb
+
+
+def parse_negadoctor_params(params_hex: str) -> dict:
+    """Decode negadoctor binary params from XMP hex string.
+
+    Layout (v2, 76 bytes):
+      int32  film_stock (0=B&W, 1=color)
+      float[4] Dmin     (film substrate color, RGB + unused)
+      float[4] wb_high  (white balance coefficients)
+      float[4] wb_low   (white balance offsets)
+      float  D_max      (max film density)
+      float  offset     (scan exposure bias)
+      float  black      (paper black point)
+      float  gamma      (paper grade)
+      float  soft_clip  (highlight rolloff threshold)
+      float  exposure   (print exposure)
+    """
+    data = bytes.fromhex(params_hex)
+    values = struct.unpack("<i 4f 4f 4f 6f", data)
+    return {
+        "film_stock": values[0],
+        "Dmin": np.array(values[1:4], dtype=np.float64),
+        "wb_high": np.array(values[5:8], dtype=np.float64),
+        "wb_low": np.array(values[9:12], dtype=np.float64),
+        "D_max": float(values[13]),
+        "offset": float(values[14]),
+        "black": float(values[15]),
+        "gamma": float(values[16]),
+        "soft_clip": float(values[17]),
+        "exposure": float(values[18]),
+    }
+
+
+def extract_negadoctor_from_xmp(xmp_path: str) -> dict:
+    """Extract the last enabled negadoctor params from a darktable XMP sidecar."""
+    tree = ET.parse(xmp_path)
+    root = tree.getroot()
+
+    ns = {
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "darktable": "http://darktable.sf.net/",
+    }
+
+    # Find all history entries, keep the last enabled negadoctor
+    last_params = None
+    for li in root.iter(f"{{{ns['rdf']}}}li"):
+        op = li.get(f"{{{ns['darktable']}}}operation")
+        enabled = li.get(f"{{{ns['darktable']}}}enabled")
+        if op == "negadoctor" and enabled == "1":
+            last_params = li.get(f"{{{ns['darktable']}}}params")
+
+    if last_params is None:
+        sys.exit("No enabled negadoctor module found in XMP sidecar")
+
+    params = parse_negadoctor_params(last_params)
+    print(f"  Negadoctor params from XMP:")
+    print(f"    Dmin:      R={params['Dmin'][0]:.6f} G={params['Dmin'][1]:.6f} B={params['Dmin'][2]:.6f}")
+    print(f"    wb_high:   R={params['wb_high'][0]:.4f} G={params['wb_high'][1]:.4f} B={params['wb_high'][2]:.4f}")
+    print(f"    wb_low:    R={params['wb_low'][0]:.4f} G={params['wb_low'][1]:.4f} B={params['wb_low'][2]:.4f}")
+    print(f"    D_max={params['D_max']:.3f}  offset={params['offset']:.3f}  "
+          f"black={params['black']:.4f}  gamma={params['gamma']:.1f}  "
+          f"soft_clip={params['soft_clip']:.2f}  exposure={params['exposure']:.4f}")
+
+    return params
+
+
+def negadoctor(rgb: np.ndarray, params: dict) -> np.ndarray:
+    """Apply the negadoctor algorithm to convert a negative to positive.
+
+    Reimplementation of darktable's negadoctor.c _process_pixel().
+    All math in float64 for precision on 16-bit data.
+
+    Pipeline:
+      1. Normalize to [0,1] and compute transmission-to-density ratio
+      2. Log density (log10)
+      3. White balance correction in log space
+      4. Print exposure + black point
+      5. Gamma (paper grade)
+      6. Soft-clip highlight rolloff
+    """
+    THRESHOLD = 2.3283064365386963e-10  # 2^(-32), from darktable
+
+    Dmin = params["Dmin"]
+    wb_high = params["wb_high"]
+    wb_low = params["wb_low"]
+    D_max = params["D_max"]
+    offset = params["offset"]
+    black = params["black"]
+    gamma = params["gamma"]
+    soft_clip = params["soft_clip"]
+    exposure = params["exposure"]
+
+    # Precompute like darktable's commit_params
+    black_effective = -exposure * (1.0 + black)
+
+    # Normalize 16-bit to [0,1] and linearize from sRGB gamma.
+    # darktable's colorin module does this before negadoctor sees the data.
+    # Without an embedded ICC profile, darktable assumes sRGB.
+    img = rgb.astype(np.float64) / 65535.0
+    img = srgb_to_linear(img)
+
+    result = np.empty_like(img, dtype=np.float64)
+
+    for c in range(3):
+        # Step 1: Transmission to density ratio
+        density = Dmin[c] / np.maximum(img[:, :, c], THRESHOLD)
+
+        # Step 2: Log density — note the NEGATION, this is what inverts the negative
+        # darktable: log_density[c] *= -LOG2_to_LOG10  (i.e. -log10(density))
+        log_density = np.log2(density) * -0.30103
+
+        # Step 3: White balance correction in log space
+        # commit_params precomputes: wb_high[c] = p->wb_high[c] / p->D_max
+        #                            offset[c]  = p->wb_high[c] * p->offset * p->wb_low[c]
+        wb_high_normed = wb_high[c] / D_max
+        offset_precomp = wb_high[c] * offset * wb_low[c]
+        corrected = wb_high_normed * log_density + offset_precomp
+
+        # Step 4: Print exposure (10^corrected) + black point
+        # darktable: print_linear = -(exposure * 10^corrected + black)
+        print_linear = -(exposure * np.power(10.0, corrected) + black_effective)
+        print_linear = np.maximum(print_linear, 0.0)
+
+        # Step 5: Gamma (paper grade)
+        print_gamma = np.power(print_linear, gamma)
+
+        # Step 6: Soft-clip highlight rolloff
+        # For values above soft_clip, apply exponential compression
+        above = print_gamma > soft_clip
+        if np.any(above):
+            sc = soft_clip
+            excess = print_gamma[above] - sc
+            print_gamma[above] = sc + (1.0 - np.exp(-excess / (1.0 - sc))) * (1.0 - sc)
+
+        result[:, :, c] = print_gamma
+
+    # Return scene-referred linear float — sigmoid and sRGB encoding applied later
+    return result
 
 
 def process(
@@ -518,14 +840,28 @@ def process(
         print(f"Inpainting {n_labels} regions (16-bit biharmonic)...")
         result = inpaint(rgb, mask, padding=inpaint_padding)
 
-    print(f"Saving cleaned negative to {output_path}...")
-    tifffile.imwrite(output_path, result)
-
     if invert_xmp is not None:
-        invert_output = str(Path(output_path).with_suffix('.positive.tif'))
-        print(f"Converting negative to positive via darktable...")
-        invert_with_darktable(output_path, invert_output, invert_xmp)
-        print(f"  Positive saved to {invert_output}")
+        print(f"Converting negative to positive (negadoctor)...")
+        nd_params = extract_negadoctor_from_xmp(invert_xmp)
+        # negadoctor returns scene-referred linear float
+        result_f = negadoctor(result, nd_params)
+
+        cat_matrix = extract_channelmixer_from_xmp(invert_xmp)
+        if cat_matrix is not None:
+            print("Applying chromatic adaptation...")
+            result_f = apply_chromatic_adaptation(result_f, cat_matrix)
+
+        sig_params = extract_sigmoid_from_xmp(invert_xmp)
+        if sig_params is not None:
+            print("Applying sigmoid tone mapping...")
+            result_f = apply_sigmoid(result_f, sig_params)
+
+        # Encode to sRGB gamma (darktable's colorout) and back to 16-bit
+        result_f = linear_to_srgb(np.clip(result_f, 0, None))
+        result = np.clip(result_f * 65535.0, 0, 65535).astype(np.uint16)
+
+    print(f"Saving result to {output_path}...")
+    tifffile.imwrite(output_path, result)
 
     print("Done.")
 
