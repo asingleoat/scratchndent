@@ -1,0 +1,1 @@
+- [nix-shell workflow](feedback_nix_shell.md) - User manages nix-shell themselves; run commands directly

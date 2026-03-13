@@ -405,7 +405,26 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
 
 MIDDLE_GREY = 0.1845
 
-# CIE CAT16 forward matrix (RGB/XYZ to LMS)
+# --- Color space conversion matrices ---
+# darktable's pipeline works in linear Rec2020 with D50 white point.
+# Scanner TIFFs are sRGB (D65). We need to convert before/after processing.
+
+# sRGB linear (D65) → linear Rec2020 (D50)
+# Combines: sRGB→XYZ(D65) → Bradford adapt D65→D50 → XYZ(D50)→Rec2020
+M_SRGB_TO_REC2020_D50 = np.array([
+    [0.62750372, 0.32927550, 0.04330266],
+    [0.06910838, 0.91951916, 0.01135963],
+    [0.01639405, 0.08801124, 0.89538034],
+])
+
+# Inverse: linear Rec2020 (D50) → sRGB linear (D65)
+M_REC2020_D50_TO_SRGB = np.array([
+    [ 1.66022695, -0.58754781, -0.07283824],
+    [-0.12455353,  1.13292614, -0.00834966],
+    [-0.01815511, -0.10060300,  1.11899818],
+])
+
+# CIE CAT16 forward matrix (XYZ to LMS)
 M_CAT16 = np.array([
     [ 0.401288,  0.650173, -0.051461],
     [-0.250268,  1.204414,  0.045854],
@@ -423,15 +442,51 @@ def _xy_to_XYZ(x: float, y: float) -> np.ndarray:
 
 
 def compute_cat16_matrix(scene_x: float, scene_y: float) -> np.ndarray:
-    """Compute a CAT16 chromatic adaptation matrix from scene illuminant to D50."""
+    """Compute a CAT16 chromatic adaptation matrix.
+
+    darktable's channelmixerrgb works in Rec2020/XYZ space, but we're
+    applying this to sRGB-linear data after negadoctor inversion. Since
+    negadoctor already flips the color relationships, we need the inverse
+    adaptation: D50 → scene illuminant (reducing blue for warm scenes).
+
+    The full correct pipeline would convert sRGB→XYZ, adapt in XYZ, then
+    XYZ→sRGB. We approximate by computing the combined matrix.
+    """
     scene_XYZ = _xy_to_XYZ(scene_x, scene_y)
     d50_XYZ = _xy_to_XYZ(*D50_xy)
 
     scene_lms = M_CAT16 @ scene_XYZ
     d50_lms = M_CAT16 @ d50_XYZ
 
-    gains = d50_lms / scene_lms
-    return M_CAT16_INV @ np.diag(gains) @ M_CAT16
+    # Rec2020 to XYZ (D50) — darktable's working space
+    M_Rec2020_to_XYZ_D65 = np.array([
+        [0.6369580, 0.1446169, 0.1688810],
+        [0.2627002, 0.6779981, 0.0593017],
+        [0.0000000, 0.0280727, 1.0609851],
+    ])
+    # Bradford D65→D50
+    M_Bradford = np.array([
+        [ 0.8951,  0.2664, -0.1614],
+        [-0.7502,  1.7135,  0.0367],
+        [ 0.0389, -0.0685,  1.0296],
+    ])
+    D65_XYZ = np.array([0.95047, 1.0, 1.08883])
+    D50_XYZ_ref = np.array([0.96429568, 1.0, 0.82510460])
+    D65_LMS = M_Bradford @ D65_XYZ
+    D50_LMS = M_Bradford @ D50_XYZ_ref
+    brad_gains = D50_LMS / D65_LMS
+    M_D65_to_D50 = np.linalg.inv(M_Bradford) @ np.diag(brad_gains) @ M_Bradford
+    M_Rec2020_to_XYZ_D50 = M_D65_to_D50 @ M_Rec2020_to_XYZ_D65
+    M_XYZ_D50_to_Rec2020 = np.linalg.inv(M_Rec2020_to_XYZ_D50)
+
+    # CAT16 adaptation: D50 → scene illuminant in XYZ space
+    # After negadoctor inversion, the scene illuminant's color cast is inverted,
+    # so we adapt away from D50 toward the scene illuminant to cancel it.
+    gains = scene_lms / d50_lms
+    M_adapt_XYZ = M_CAT16_INV @ np.diag(gains) @ M_CAT16
+
+    # Combined: Rec2020 → XYZ(D50) → CAT16 adapt → XYZ(D50) → Rec2020
+    return M_XYZ_D50_to_Rec2020 @ M_adapt_XYZ @ M_Rec2020_to_XYZ_D50
 
 
 def extract_channelmixer_from_xmp(xmp_path: str) -> np.ndarray | None:
@@ -477,12 +532,12 @@ def extract_channelmixer_from_xmp(xmp_path: str) -> np.ndarray | None:
     return compute_cat16_matrix(scene_x, scene_y)
 
 
-def apply_chromatic_adaptation(img: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-    """Apply a 3x3 chromatic adaptation matrix to a linear RGB image."""
+def apply_color_matrix(img: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Apply a 3x3 color matrix to a linear RGB image."""
     h, w, _ = img.shape
     flat = img.reshape(-1, 3)
-    adapted = (matrix @ flat.T).T
-    return adapted.reshape(h, w, 3)
+    result = (matrix @ flat.T).T
+    return result.reshape(h, w, 3)
 
 
 def parse_sigmoid_params(params_hex: str) -> dict:
@@ -745,11 +800,12 @@ def negadoctor(rgb: np.ndarray, params: dict) -> np.ndarray:
     # Precompute like darktable's commit_params
     black_effective = -exposure * (1.0 + black)
 
-    # Normalize 16-bit to [0,1] and linearize from sRGB gamma.
-    # darktable's colorin module does this before negadoctor sees the data.
-    # Without an embedded ICC profile, darktable assumes sRGB.
+    # Normalize 16-bit to [0,1], linearize from sRGB gamma, then convert
+    # to darktable's working space (linear Rec2020, D50 white point).
+    # darktable's colorin module does exactly this before negadoctor sees data.
     img = rgb.astype(np.float64) / 65535.0
     img = srgb_to_linear(img)
+    img = apply_color_matrix(img, M_SRGB_TO_REC2020_D50)
 
     result = np.empty_like(img, dtype=np.float64)
 
@@ -849,14 +905,16 @@ def process(
         cat_matrix = extract_channelmixer_from_xmp(invert_xmp)
         if cat_matrix is not None:
             print("Applying chromatic adaptation...")
-            result_f = apply_chromatic_adaptation(result_f, cat_matrix)
+            result_f = apply_color_matrix(result_f, cat_matrix)
 
         sig_params = extract_sigmoid_from_xmp(invert_xmp)
         if sig_params is not None:
             print("Applying sigmoid tone mapping...")
             result_f = apply_sigmoid(result_f, sig_params)
 
-        # Encode to sRGB gamma (darktable's colorout) and back to 16-bit
+        # Convert Rec2020(D50) back to sRGB(D65) then apply sRGB gamma
+        # (darktable's colorout module)
+        result_f = apply_color_matrix(result_f, M_REC2020_D50_TO_SRGB)
         result_f = linear_to_srgb(np.clip(result_f, 0, None))
         result = np.clip(result_f * 65535.0, 0, 65535).astype(np.uint16)
 

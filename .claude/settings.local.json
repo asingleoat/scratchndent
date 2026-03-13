@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(nix search:*)",
+      "Bash(python3 -c \"import tifffile; t = tifffile.TiffFile\\('/Users/tim/code/scratchndent/untitled.tif'\\); print\\('Pages:', len\\(t.pages\\)\\); p = t.pages[0]; print\\('Shape:', p.shape\\); print\\('Dtype:', p.dtype\\); print\\('Tags:'\\); [print\\(f'  {tag.name}: {tag.value}'\\) for tag in p.tags.values\\(\\)]\")",
+      "Bash(python3 -c \"from PIL import Image; im = Image.open\\('/Users/tim/code/scratchndent/untitled.tif'\\); print\\('Mode:', im.mode\\); print\\('Size:', im.size\\); print\\('Info:', im.info\\)\")",
+      "Bash(exiftool /Users/tim/code/scratchndent/untitled.tif 2>/dev/null || echo 'exiftool not available')"
+    ]
+  }
+}
