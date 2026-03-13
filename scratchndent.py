@@ -238,29 +238,45 @@ def estimate_local_grain(
             grain_pixels = roi_rgb[surround, c] - signal[surround, c]
             grain_std[c] = np.std(grain_pixels)
 
-    # Compute radial power spectrum of the grain for frequency shaping
-    # Use a square patch from the surround if possible
+    # Compute radial power spectrum of the grain for frequency shaping.
+    # Zero out defect pixels in the grain image and use the full ROI with a
+    # window function — this uses all available clean surround data rather
+    # than hoping a small square patch lines up.
     grain_spectrum = None
-    sz = min(h, w, 64)
-    if sz >= 16 and np.count_nonzero(surround) > sz * sz * 0.3:
-        # Find a clean square patch in the surround for spectrum estimation
-        # Use the center channel (green) as representative
-        grain_channel = roi_rgb[:, :, 1] - signal[:, :, 1]
-        # Window to avoid edge artifacts
-        patch = grain_channel[:sz, :sz]
-        window = np.outer(np.hanning(sz), np.hanning(sz))
-        fft = np.fft.fft2(patch * window)
-        power = np.abs(fft) ** 2
+    if np.count_nonzero(surround) > 64:
+        # Average spectrum across RGB channels
+        grain_image = roi_rgb - signal
+        # Zero out defect pixels so they don't contaminate the spectrum
+        grain_image[roi_mask] = 0.0
+
+        # Window to reduce spectral leakage from edges and zeroed defects
+        window = np.outer(np.hanning(h), np.hanning(w))
+
+        spectra = []
+        for c in range(3):
+            fft = np.fft.fftshift(np.fft.fft2(grain_image[:, :, c] * window))
+            power = np.abs(fft) ** 2
+            spectra.append(power)
+        avg_power = np.mean(spectra, axis=0)
+
         # Radial average
-        cy, cx = sz // 2, sz // 2
-        y_grid, x_grid = np.mgrid[:sz, :sz]
-        r = np.sqrt((x_grid - cx) ** 2 + (y_grid - cy) ** 2).astype(int)
-        r_max = sz // 2
+        cy, cx = h // 2, w // 2
+        y_grid, x_grid = np.mgrid[:h, :w]
+        r = np.sqrt((x_grid - cx) ** 2 + (y_grid - cy) ** 2)
+        r_int = r.astype(int)
+        r_max = min(h, w) // 2
+
         spectrum = np.zeros(r_max)
         for ri in range(r_max):
-            ring = power[r == ri]
+            ring = avg_power[r_int == ri]
             if len(ring) > 0:
                 spectrum[ri] = np.mean(ring)
+
+        # Compensate for zeroed defect pixels reducing power
+        clean_fraction = np.count_nonzero(~roi_mask) / roi_mask.size
+        if clean_fraction > 0.1:
+            spectrum /= clean_fraction ** 2
+
         if np.sum(spectrum) > 0:
             grain_spectrum = spectrum / np.sum(spectrum)
 
@@ -275,53 +291,52 @@ def synthesize_grain(
 ) -> np.ndarray:
     """Synthesize film grain noise matching measured statistics.
 
-    If a grain spectrum is available, shapes the noise to match the measured
-    frequency distribution. Otherwise falls back to Gaussian noise with
-    matched standard deviation.
+    Film grain has a characteristic pink-ish (1/f) power spectrum — more
+    energy at low frequencies than white noise. If a measured spectrum is
+    available, we shape white noise in the frequency domain to match it.
+    Otherwise we fall back to a 1/f approximation which is closer to real
+    grain than white noise.
     """
     h, w = shape
     grain = np.zeros((h, w, n_channels), dtype=np.float64)
 
+    # Build radial frequency map (distance from DC in frequency space)
+    cy, cx = h // 2, w // 2
+    y_grid, x_grid = np.mgrid[:h, :w]
+    r = np.sqrt((x_grid - cx) ** 2 + (y_grid - cy) ** 2)
+    # Avoid division by zero at DC
+    r_safe = np.where(r > 0, r, 1.0)
+
+    if grain_spectrum is not None and len(grain_spectrum) > 4:
+        # Interpolate measured spectrum into a 2D radial amplitude filter
+        r_max = len(grain_spectrum)
+        # Convert power spectrum to amplitude spectrum
+        amp_spectrum = np.sqrt(np.maximum(grain_spectrum, 0))
+        # Interpolate to cover all radial distances in the output
+        from numpy import interp
+        r_flat = r.ravel()
+        amp_flat = interp(r_flat, np.arange(r_max), amp_spectrum,
+                          right=amp_spectrum[-1])
+        amp_filter = np.fft.ifftshift(amp_flat.reshape(h, w))
+    else:
+        # Fallback: 1/f spectrum (pink noise), typical of film grain
+        amp_filter = np.fft.ifftshift(1.0 / r_safe)
+
     for c in range(n_channels):
         noise = np.random.randn(h, w)
+        fft = np.fft.fft2(noise)
 
-        if grain_spectrum is not None and len(grain_spectrum) > 1:
-            # Shape noise in frequency domain to match grain spectrum
-            fft = np.fft.fft2(noise)
-            cy, cx = h // 2, w // 2
-            y_grid, x_grid = np.mgrid[:h, :w]
-            r = np.sqrt((x_grid - cx) ** 2 + (y_grid - cy) ** 2)
+        # Apply spectral shaping
+        shaped_fft = fft * amp_filter
 
-            # Build radial filter from measured spectrum
-            r_max = len(grain_spectrum)
-            target_power = np.zeros((h, w), dtype=np.float64)
-            for ri in range(r_max):
-                ring = (r >= ri) & (r < ri + 1)
-                target_power[ring] = grain_spectrum[ri]
-            # Smooth transition beyond measured range
-            target_power[r >= r_max] = grain_spectrum[-1]
+        shaped = np.real(np.fft.ifft2(shaped_fft))
 
-            # Apply as amplitude filter
-            with np.errstate(divide='ignore', invalid='ignore'):
-                current_power = np.abs(fft) ** 2
-                current_power_shifted = np.fft.fftshift(current_power)
-                target_shifted = np.fft.fftshift(target_power)
-                # Avoid division by zero
-                scale = np.where(
-                    current_power_shifted > 0,
-                    np.sqrt(target_shifted / current_power_shifted),
-                    0,
-                )
-            fft_shifted = np.fft.fftshift(fft)
-            shaped = np.fft.ifftshift(fft_shifted * scale)
-            noise = np.real(np.fft.ifft2(shaped))
+        # Normalize to unit variance then scale to match measured grain
+        noise_std = np.std(shaped)
+        if noise_std > 0:
+            shaped = shaped / noise_std
 
-            # Normalize to unit variance then scale
-            noise_std = np.std(noise)
-            if noise_std > 0:
-                noise = noise / noise_std
-
-        grain[:, :, c] = noise * grain_std[c]
+        grain[:, :, c] = shaped * grain_std[c]
 
     return grain
 
