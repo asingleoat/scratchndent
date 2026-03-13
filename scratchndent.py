@@ -14,7 +14,10 @@ the defects.
 """
 
 import argparse
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -401,6 +404,70 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
     return result
 
 
+def invert_with_darktable(
+    input_path: str,
+    output_path: str,
+    xmp_path: str,
+) -> None:
+    """Convert a negative to positive using darktable-cli with a sidecar XMP.
+
+    The XMP sidecar contains a full darktable processing history (negadoctor,
+    sigmoid, channel mixer, etc.) tuned for a specific scanner + film stock
+    combination. This gives much better results than a generic algorithmic
+    inversion.
+
+    darktable-cli applies the processing pipeline and exports to TIFF.
+    """
+    dt = shutil.which("darktable-cli")
+    if dt is None:
+        sys.exit("darktable-cli not found in PATH. Install darktable or add "
+                 "it to your shell.nix.")
+
+    if not Path(xmp_path).exists():
+        sys.exit(f"XMP sidecar not found: {xmp_path}")
+
+    # darktable-cli expects the XMP next to the input file, or passed via
+    # --xmp flag. We copy it next to a temp input to avoid polluting the
+    # original location.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_input = Path(tmpdir) / "input.tif"
+        tmp_xmp = Path(tmpdir) / "input.tif.xmp"
+        out_dir = Path(tmpdir) / "out"
+        out_dir.mkdir()
+
+        # Symlink the input to avoid copying a ~1GB file
+        tmp_input.symlink_to(Path(input_path).resolve())
+        shutil.copy2(xmp_path, tmp_xmp)
+
+        cmd = [
+            dt,
+            str(tmp_input),
+            str(tmp_xmp),
+            str(out_dir),
+            "--out-ext", "tif",
+            "--core",
+            "--library", ":memory:",
+            "--configdir", str(tmpdir),
+        ]
+        print(f"  Running: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(f"  darktable-cli stderr:\n{result.stderr}", file=sys.stderr)
+            sys.exit(f"darktable-cli failed with exit code {result.returncode}")
+
+        # darktable writes to out_dir with the input filename
+        outputs = list(out_dir.glob("*.tif"))
+        if not outputs:
+            sys.exit("darktable-cli did not produce output")
+
+        shutil.move(str(outputs[0]), output_path)
+
+
 def process(
     input_path: str,
     output_path: str,
@@ -413,8 +480,9 @@ def process(
     close_radius: int = 5,
     inpaint_padding: int = 16,
     save_mask: bool = False,
+    invert_xmp: str | None = None,
 ) -> None:
-    """Full pipeline: load, align, mask, inpaint, save."""
+    """Full pipeline: load, align, mask, inpaint, optionally invert negative."""
     print(f"Loading {input_path}...")
     rgb, ir = load_tiff(input_path)
     print(f"  RGB: {rgb.shape}, IR: {ir.shape}")
@@ -444,13 +512,20 @@ def process(
         print(f"  Mask saved to {mask_path}")
 
     if defect_pixels == 0:
-        print("No defects found, saving original.")
-        tifffile.imwrite(output_path, rgb)
+        print("No defects found.")
+        result = rgb
     else:
         print(f"Inpainting {n_labels} regions (16-bit biharmonic)...")
         result = inpaint(rgb, mask, padding=inpaint_padding)
-        print(f"Saving result to {output_path}...")
-        tifffile.imwrite(output_path, result)
+
+    print(f"Saving cleaned negative to {output_path}...")
+    tifffile.imwrite(output_path, result)
+
+    if invert_xmp is not None:
+        invert_output = str(Path(output_path).with_suffix('.positive.tif'))
+        print(f"Converting negative to positive via darktable...")
+        invert_with_darktable(output_path, invert_output, invert_xmp)
+        print(f"  Positive saved to {invert_output}")
 
     print("Done.")
 
@@ -496,6 +571,11 @@ def main():
         "--save-mask", action="store_true",
         help="Save the defect mask as a separate TIFF",
     )
+    parser.add_argument(
+        "--invert-xmp", type=str, default=None, metavar="XMP",
+        help="Convert negative to positive using darktable-cli with the "
+             "given XMP sidecar (contains negadoctor + processing settings)",
+    )
 
     args = parser.parse_args()
 
@@ -519,6 +599,7 @@ def main():
         close_radius=args.close_radius,
         inpaint_padding=args.inpaint_padding,
         save_mask=args.save_mask,
+        invert_xmp=args.invert_xmp,
     )
 
 
