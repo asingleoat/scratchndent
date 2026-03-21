@@ -92,11 +92,10 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
         print("Offset negligible, skipping warp")
         return ir
 
-    aligned = cv2.warpAffine(
-        ir, warp_matrix, (ir.shape[1], ir.shape[0]),
-        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-        borderMode=cv2.BORDER_REFLECT,
-    )
+    # Use scipy shift for sub-pixel translation — avoids OpenCV's SHRT_MAX
+    # limit on images taller/wider than 32767 pixels.
+    from scipy.ndimage import shift as ndimage_shift
+    aligned = ndimage_shift(ir, (-ty, -tx), order=1, mode='reflect')
     return aligned
 
 

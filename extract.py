@@ -19,6 +19,7 @@ import sys
 import threading
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -47,62 +48,161 @@ from scratchndent import (
 # ---------------------------------------------------------------------------
 INPUT_PATH: str = ""
 OUTPUT_DIR: Path = Path(".")
-FULL_IMG: np.ndarray | None = None  # full-res image (uint16 or uint8)
-PREVIEW_JPEG: bytes = b""           # downscaled JPEG for the browser
-PREVIEW_SCALE: float = 1.0          # preview pixels / full pixels
-IMAGE_LIST: list[str] = []          # all image paths in folder
-IMAGE_IDX: int = 0                  # current index into IMAGE_LIST
+FULL_IMG: np.ndarray | None = None       # full-res processed image (lazy, None until export)
+FULL_IMG_READY: bool = False              # True once full-res processing is done
+PREVIEW_JPEG: bytes = b""                # downscaled JPEG for the browser
+PREVIEW_SCALE: float = 1.0               # preview pixels / full pixels
+FULL_WIDTH: int = 0                       # full-res dimensions (from raw load)
+FULL_HEIGHT: int = 0
+IMAGE_LIST: list[str] = []               # all image paths in folder
+IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
 INVERT_XMP: str | None = None
-IR_CLEAN: bool = True                # auto-detect by default
+IR_CLEAN: bool = True                     # auto-detect by default
 PREVIEW_SIZE: int = 2400
-LOADING: bool = False               # True while switching images
+LOADING: bool = False                     # True while switching images
+HAS_IR: bool = False                      # whether current image has IR channel
+PROGRESS: str = ""                        # current export/processing status for GUI
+
+
+def set_progress(msg: str) -> None:
+    """Update progress status for both stdout and GUI polling."""
+    global PROGRESS
+    PROGRESS = msg
+    print(f"  [{msg}]")
+
+
+def apply_inversion(img: np.ndarray) -> np.ndarray:
+    """Apply negadoctor + CAT16 + sigmoid pipeline. Input: uint16, output: uint16."""
+    nd_params = extract_negadoctor_from_xmp(INVERT_XMP)
+    result_f = negadoctor(img, nd_params)
+
+    cat_matrix = extract_channelmixer_from_xmp(INVERT_XMP)
+    if cat_matrix is not None:
+        result_f = apply_color_matrix(result_f, cat_matrix)
+
+    sig_params = extract_sigmoid_from_xmp(INVERT_XMP)
+    if sig_params is not None:
+        result_f = apply_sigmoid(result_f, sig_params)
+
+    result_f = apply_color_matrix(result_f, M_REC2020_D50_TO_SRGB)
+    result_f = linear_to_srgb(np.clip(result_f, 0, None))
+    return np.clip(result_f * 65535.0, 0, 65535).astype(np.uint16)
+
+
+def apply_ir_clean(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
+    """Run IR-based dust/scratch removal. Returns cleaned rgb."""
+    ir_aligned = align_ir(rgb, ir)
+    mask = make_defect_mask(ir_aligned)
+    if np.count_nonzero(mask) > 0:
+        return inpaint(rgb, mask)
+    return rgb
+
+
+def process_full_res() -> np.ndarray:
+    """Load and process the current image at full resolution."""
+    global FULL_IMG, FULL_IMG_READY
+    if FULL_IMG_READY:
+        return FULL_IMG
+
+    set_progress("Loading full-resolution image...")
+    rgb, ir = load_image(INPUT_PATH)
+    h, w = rgb.shape[:2]
+    set_progress(f"Loaded {w}x{h} image")
+
+    if IR_CLEAN and ir is not None:
+        set_progress("Aligning IR channel...")
+        ir_aligned = align_ir(rgb, ir)
+        set_progress("Detecting defects...")
+        mask = make_defect_mask(ir_aligned)
+        n_defects = np.count_nonzero(mask)
+        if n_defects > 0:
+            set_progress(f"Inpainting {n_defects} defect pixels...")
+            rgb = inpaint(rgb, mask)
+        else:
+            set_progress("No defects found")
+
+    if INVERT_XMP:
+        set_progress("Inverting negative (negadoctor)...")
+        rgb = apply_inversion(rgb)
+
+    FULL_IMG = rgb
+    FULL_IMG_READY = True
+    set_progress("Full-res processing complete")
+    return FULL_IMG
 
 
 def switch_to_image(idx: int) -> None:
-    """Load image at IMAGE_LIST[idx], apply inversion if configured, generate preview."""
-    global INPUT_PATH, FULL_IMG, PREVIEW_JPEG, PREVIEW_SCALE, IMAGE_IDX, LOADING
+    """Load image, generate preview at reduced resolution for speed."""
+    global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
+    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR
     LOADING = True
+    FULL_IMG = None
+    FULL_IMG_READY = False
     IMAGE_IDX = idx
     INPUT_PATH = IMAGE_LIST[idx]
 
     print(f"Loading {INPUT_PATH} ({idx + 1}/{len(IMAGE_LIST)})...")
     rgb, ir = load_image(INPUT_PATH)
     h, w = rgb.shape[:2]
+    FULL_WIDTH, FULL_HEIGHT = w, h
+    HAS_IR = ir is not None
     print(f"  Image: {w}x{h}, {rgb.dtype}")
 
-    if IR_CLEAN and ir is not None:
-        print("  IR channel found, running dust/scratch removal...")
-        ir = align_ir(rgb, ir)
-        mask = make_defect_mask(ir)
-        n_defects = np.count_nonzero(mask)
-        if n_defects > 0:
-            print(f"  Inpainting {n_defects} defect pixels...")
-            rgb = inpaint(rgb, mask)
+    # Downscale for fast preview processing — use longer dimension for quality
+    proc_dim = max(PREVIEW_SIZE, 6000)
+    proc_scale = min(proc_dim / max(h, w), 1.0)
+    preview_scale = min(PREVIEW_SIZE / max(h, w), 1.0)
+    if proc_scale < 1.0:
+        pw, ph = int(w * proc_scale), int(h * proc_scale)
+        small_rgb = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
+        if ir is not None:
+            small_ir = cv2.resize(ir, (pw, ph), interpolation=cv2.INTER_AREA)
         else:
-            print("  No defects found.")
+            small_ir = None
+    else:
+        small_rgb = rgb
+        small_ir = ir
 
-    FULL_IMG = rgb
+    # IR clean at preview resolution (skip inpainting — just for visual)
+    if IR_CLEAN and small_ir is not None:
+        print("  IR preview processing...")
+        # Alignment not needed at preview scale, just mask + simple infill
+        ir_aligned = align_ir(small_rgb, small_ir)
+        mask = make_defect_mask(ir_aligned)
+        if np.count_nonzero(mask) > 0:
+            # Use cv2 inpaint for speed at preview resolution
+            if small_rgb.dtype == np.uint16:
+                preview8 = (small_rgb >> 8).astype(np.uint8)
+            else:
+                preview8 = small_rgb
+            preview8 = cv2.inpaint(preview8, mask, 3, cv2.INPAINT_TELEA)
+            small_rgb = preview8  # now uint8, fine for preview
 
+    # Inversion at preview resolution
     if INVERT_XMP:
-        print(f"  Inverting negative...")
-        nd_params = extract_negadoctor_from_xmp(INVERT_XMP)
-        result_f = negadoctor(FULL_IMG, nd_params)
+        print("  Inverting (preview)...")
+        # Ensure uint16 for negadoctor
+        if small_rgb.dtype == np.uint8:
+            small_rgb = small_rgb.astype(np.uint16) * 257
+        small_rgb = apply_inversion(small_rgb)
 
-        cat_matrix = extract_channelmixer_from_xmp(INVERT_XMP)
-        if cat_matrix is not None:
-            result_f = apply_color_matrix(result_f, cat_matrix)
+    # Generate JPEG — downscale processed result to preview size
+    if small_rgb.dtype == np.uint16:
+        preview8 = (small_rgb >> 8).astype(np.uint8)
+    else:
+        preview8 = small_rgb
+    # Further downscale if we processed at higher res than preview
+    if proc_scale > preview_scale:
+        final_w = int(w * preview_scale)
+        final_h = int(h * preview_scale)
+        preview8 = cv2.resize(preview8, (final_w, final_h), interpolation=cv2.INTER_AREA)
+    pil_img = Image.fromarray(preview8)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=90)
+    PREVIEW_JPEG = buf.getvalue()
+    PREVIEW_SCALE = preview_scale
 
-        sig_params = extract_sigmoid_from_xmp(INVERT_XMP)
-        if sig_params is not None:
-            result_f = apply_sigmoid(result_f, sig_params)
-
-        result_f = apply_color_matrix(result_f, M_REC2020_D50_TO_SRGB)
-        result_f = linear_to_srgb(np.clip(result_f, 0, None))
-        FULL_IMG = np.clip(result_f * 65535.0, 0, 65535).astype(np.uint16)
-        print("  Inversion complete.")
-
-    PREVIEW_JPEG, PREVIEW_SCALE = make_preview(FULL_IMG, PREVIEW_SIZE)
-    print(f"  Preview scale: {PREVIEW_SCALE:.4f}")
+    print(f"  Preview ready ({preview8.shape[1]}x{preview8.shape[0]}, scale={preview_scale:.4f})")
     LOADING = False
 
 
@@ -124,25 +224,6 @@ def load_image(path: str) -> tuple[np.ndarray, np.ndarray | None]:
         sys.exit(f"Could not load image: {path}")
     return img, ir
 
-
-def make_preview(img: np.ndarray, max_dim: int = 2400) -> tuple[bytes, float]:
-    """Create a JPEG preview, return (jpeg_bytes, scale_factor)."""
-    h, w = img.shape[:2]
-    scale = min(max_dim / max(h, w), 1.0)
-
-    if img.dtype == np.uint16:
-        preview = (img >> 8).astype(np.uint8)
-    else:
-        preview = img
-
-    if scale < 1.0:
-        new_w, new_h = int(w * scale), int(h * scale)
-        preview = cv2.resize(preview, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-    pil_img = Image.fromarray(preview)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=85)
-    return buf.getvalue(), scale
 
 
 def crop_rotated_rect(
@@ -695,8 +776,21 @@ document.getElementById('btn-clear').addEventListener('click', () => {
 
 document.getElementById('btn-export').addEventListener('click', async () => {
     if (selections.length === 0) { statusEl.textContent = 'No selections to export'; return; }
+    const exportBtn = document.getElementById('btn-export');
+    exportBtn.disabled = true;
+    exportBtn.textContent = 'Exporting...';
     const basename = document.getElementById('basename').value || 'frame';
-    statusEl.textContent = 'Exporting...';
+    statusEl.textContent = 'Starting export...';
+
+    // Poll progress while export runs
+    const pollId = setInterval(async () => {
+        try {
+            const pr = await fetch('/progress');
+            const pj = await pr.json();
+            if (pj.status) statusEl.textContent = pj.status;
+        } catch {}
+    }, 500);
+
     const rects = selections.map(s => ({
         cx: (s.x + s.w / 2) / previewScale,
         cy: (s.y + s.h / 2) / previewScale,
@@ -704,13 +798,20 @@ document.getElementById('btn-export').addEventListener('click', async () => {
         h: s.h / previewScale,
         angle: s.angle * 180 / Math.PI,
     }));
-    const resp = await fetch('/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ basename, rects }),
-    });
-    const result = await resp.json();
-    statusEl.textContent = result.message;
+    try {
+        const resp = await fetch('/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ basename, rects }),
+        });
+        const result = await resp.json();
+        statusEl.textContent = result.message;
+    } catch (e) {
+        statusEl.textContent = 'Export failed: ' + e.message;
+    }
+    clearInterval(pollId);
+    exportBtn.disabled = false;
+    exportBtn.textContent = 'Export all';
 });
 
 // --- Resize handling ---
@@ -734,6 +835,10 @@ document.addEventListener('keydown', (e) => {
 # ---------------------------------------------------------------------------
 # HTTP Server
 # ---------------------------------------------------------------------------
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # silence request logs
@@ -745,10 +850,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/preview":
             self._respond(200, "image/jpeg", PREVIEW_JPEG)
         elif parsed.path == "/info":
-            h, w = FULL_IMG.shape[:2]
             info = {
-                "full_width": w,
-                "full_height": h,
+                "full_width": FULL_WIDTH,
+                "full_height": FULL_HEIGHT,
                 "preview_scale": PREVIEW_SCALE,
                 "filename": Path(INPUT_PATH).name,
                 "image_idx": IMAGE_IDX,
@@ -756,6 +860,9 @@ class Handler(BaseHTTPRequestHandler):
                 "loading": LOADING,
             }
             self._respond(200, "application/json", json.dumps(info).encode())
+        elif parsed.path == "/progress":
+            self._respond(200, "application/json",
+                          json.dumps({"status": PROGRESS}).encode())
         elif parsed.path == "/images":
             data = {
                 "images": [Path(p).name for p in IMAGE_LIST],
@@ -777,9 +884,8 @@ class Handler(BaseHTTPRequestHandler):
             idx = body.get("idx", 0)
             if 0 <= idx < len(IMAGE_LIST):
                 switch_to_image(idx)
-                h, w = FULL_IMG.shape[:2]
                 info = {
-                    "full_width": w, "full_height": h,
+                    "full_width": FULL_WIDTH, "full_height": FULL_HEIGHT,
                     "preview_scale": PREVIEW_SCALE,
                     "filename": Path(INPUT_PATH).name,
                     "image_idx": IMAGE_IDX,
@@ -805,15 +911,20 @@ def handle_export(body: dict) -> dict:
     default_base = Path(INPUT_PATH).stem
     basename = body.get("basename", default_base)
     rects = body.get("rects", [])
+    n_rects = len(rects)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     exported = []
 
+    set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
+    full = process_full_res()
+
     for i, r in enumerate(rects):
+        set_progress(f"Cropping frame {i + 1}/{n_rects}...")
         cx, cy, w, h = r["cx"], r["cy"], r["w"], r["h"]
         angle = r.get("angle", 0)
 
-        cropped = crop_rotated_rect(FULL_IMG, cx, cy, w, h, angle)
+        cropped = crop_rotated_rect(full, cx, cy, w, h, angle)
         out_name = f"{basename}_{i + 1:02d}.tif"
         out_path = OUTPUT_DIR / out_name
         # Don't overwrite existing files
@@ -822,11 +933,13 @@ def handle_export(body: dict) -> dict:
             out_name = f"{basename}_{i + 1:02d}_{n}.tif"
             out_path = OUTPUT_DIR / out_name
             n += 1
+        set_progress(f"Writing {out_name} ({cropped.shape[1]}x{cropped.shape[0]})...")
         tifffile.imwrite(str(out_path), cropped)
         exported.append(out_name)
-        print(f"  Exported {out_path} ({cropped.shape[1]}x{cropped.shape[0]})")
 
-    return {"message": f"Exported {len(exported)} frames to {OUTPUT_DIR}/", "files": exported}
+    msg = f"Exported {len(exported)} frame{'s' if len(exported) != 1 else ''} to {OUTPUT_DIR}/"
+    set_progress(msg)
+    return {"message": msg, "files": exported}
 
 
 TIFF_EXTS = {".tif", ".tiff"}
@@ -893,7 +1006,7 @@ def main():
     print(f"Found {len(IMAGE_LIST)} image(s)")
     switch_to_image(start_idx)
 
-    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    server = ThreadedHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
     print(f"Serving at {url}")
 
