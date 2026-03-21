@@ -22,6 +22,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import tifffile
+from numba import njit, prange
 from skimage.filters import meijering
 from skimage.restoration import inpaint_biharmonic
 
@@ -533,10 +534,7 @@ def extract_channelmixer_from_xmp(xmp_path: str) -> np.ndarray | None:
 
 def apply_color_matrix(img: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     """Apply a 3x3 color matrix to a linear RGB image."""
-    h, w, _ = img.shape
-    flat = img.reshape(-1, 3)
-    result = (matrix @ flat.T).T
-    return result.reshape(h, w, 3)
+    return _apply_color_matrix_fast(img, matrix)
 
 
 def parse_sigmoid_params(params_hex: str) -> dict:
@@ -672,38 +670,31 @@ def apply_sigmoid(img: np.ndarray, params: dict) -> np.ndarray:
           f"paper_power={d['paper_power']:.4f} film_fog={d['film_fog']:.6f} "
           f"paper_exp={d['paper_exposure']:.6f}")
 
-    result = np.empty_like(img)
-    for c in range(3):
-        result[:, :, c] = _generalized_loglogistic_sigmoid(
-            img[:, :, c],
-            d["white_target"],
-            d["paper_exposure"],
-            d["film_fog"],
-            d["film_power"],
-            d["paper_power"],
-        )
-
-    return result
+    h, w, _ = img.shape
+    flat = img.reshape(-1, 3).astype(np.float64)
+    out = np.empty_like(flat)
+    _sigmoid_kernel(flat, out, flat.shape[0],
+                    d["white_target"], d["paper_exposure"],
+                    d["film_fog"], d["film_power"], d["paper_power"])
+    return out.reshape(h, w, 3)
 
 
 def srgb_to_linear(img: np.ndarray) -> np.ndarray:
     """Convert sRGB gamma-encoded values to linear light."""
-    linear = np.where(
-        img <= 0.04045,
-        img / 12.92,
-        np.power((img + 0.055) / 1.055, 2.4),
-    )
-    return linear
+    h, w, c = img.shape
+    flat = img.reshape(-1, 3).astype(np.float64)
+    out = np.empty_like(flat)
+    _srgb_to_linear_kernel(flat, out, flat.shape[0])
+    return out.reshape(h, w, c)
 
 
 def linear_to_srgb(img: np.ndarray) -> np.ndarray:
     """Convert linear light values to sRGB gamma-encoded."""
-    srgb = np.where(
-        img <= 0.0031308,
-        img * 12.92,
-        1.055 * np.power(np.maximum(img, 0), 1.0 / 2.4) - 0.055,
-    )
-    return srgb
+    h, w, c = img.shape
+    flat = img.reshape(-1, 3).astype(np.float64)
+    out = np.empty_like(flat)
+    _linear_to_srgb_kernel(flat, out, flat.shape[0])
+    return out.reshape(h, w, c)
 
 
 def parse_negadoctor_params(params_hex: str) -> dict:
@@ -770,6 +761,124 @@ def extract_negadoctor_from_xmp(xmp_path: str) -> dict:
     return params
 
 
+@njit(parallel=True, cache=True)
+def _negadoctor_kernel(
+    img_flat, out_flat, n_pixels,
+    Dmin_r, Dmin_g, Dmin_b,
+    wb_high_r, wb_high_g, wb_high_b,
+    wb_low_r, wb_low_g, wb_low_b,
+    D_max, offset, exposure, black_effective, gamma, soft_clip,
+):
+    """Fused negadoctor kernel — processes all pixels in parallel via numba."""
+    THRESHOLD = 2.3283064365386963e-10
+    LOG2_TO_LOG10 = 0.30103
+
+    Dmin = (Dmin_r, Dmin_g, Dmin_b)
+    wb_high = (wb_high_r, wb_high_g, wb_high_b)
+    wb_low = (wb_low_r, wb_low_g, wb_low_b)
+
+    for i in prange(n_pixels):
+        for c in range(3):
+            val = img_flat[i, c]
+
+            # Transmission to density ratio
+            density = Dmin[c] / max(val, THRESHOLD)
+
+            # Log density (negated = inversion)
+            log_density = np.log2(density) * -LOG2_TO_LOG10
+
+            # White balance correction in log space
+            wb_high_normed = wb_high[c] / D_max
+            offset_precomp = wb_high[c] * offset * wb_low[c]
+            corrected = wb_high_normed * log_density + offset_precomp
+
+            # Print exposure + black point
+            print_linear = -(exposure * 10.0 ** corrected + black_effective)
+            if print_linear < 0.0:
+                print_linear = 0.0
+
+            # Gamma (paper grade)
+            print_gamma = print_linear ** gamma
+
+            # Soft-clip highlight rolloff
+            if print_gamma > soft_clip:
+                sc = soft_clip
+                excess = print_gamma - sc
+                print_gamma = sc + (1.0 - np.exp(-excess / (1.0 - sc))) * (1.0 - sc)
+
+            out_flat[i, c] = print_gamma
+
+
+@njit(parallel=True, cache=True)
+def _sigmoid_kernel(img_flat, out_flat, n_pixels,
+                    magnitude, paper_exp, film_fog, film_power, paper_power):
+    """Fused sigmoid kernel — per-pixel generalized log-logistic."""
+    for i in prange(n_pixels):
+        for c in range(3):
+            val = img_flat[i, c]
+            if val < 0.0:
+                val = 0.0
+            film_response = (film_fog + val) ** film_power
+            paper_response = magnitude * (
+                film_response / (paper_exp + film_response)
+            ) ** paper_power
+            if np.isnan(paper_response):
+                paper_response = magnitude
+            out_flat[i, c] = paper_response
+
+
+@njit(parallel=True, cache=True)
+def _srgb_to_linear_kernel(img_flat, out_flat, n_pixels):
+    """sRGB gamma to linear, per-pixel parallel."""
+    for i in prange(n_pixels):
+        for c in range(3):
+            v = img_flat[i, c]
+            if v <= 0.04045:
+                out_flat[i, c] = v / 12.92
+            else:
+                out_flat[i, c] = ((v + 0.055) / 1.055) ** 2.4
+
+
+@njit(parallel=True, cache=True)
+def _linear_to_srgb_kernel(img_flat, out_flat, n_pixels):
+    """Linear to sRGB gamma, per-pixel parallel."""
+    for i in prange(n_pixels):
+        for c in range(3):
+            v = img_flat[i, c]
+            if v < 0.0:
+                v = 0.0
+            if v <= 0.0031308:
+                out_flat[i, c] = v * 12.92
+            else:
+                out_flat[i, c] = 1.055 * v ** (1.0 / 2.4) - 0.055
+
+
+@njit(parallel=True, cache=True)
+def _color_matrix_kernel(img_flat, out_flat, n_pixels,
+                         m00, m01, m02, m10, m11, m12, m20, m21, m22):
+    """3x3 color matrix multiply, per-pixel parallel."""
+    for i in prange(n_pixels):
+        r = img_flat[i, 0]
+        g = img_flat[i, 1]
+        b = img_flat[i, 2]
+        out_flat[i, 0] = m00 * r + m01 * g + m02 * b
+        out_flat[i, 1] = m10 * r + m11 * g + m12 * b
+        out_flat[i, 2] = m20 * r + m21 * g + m22 * b
+
+
+def _apply_color_matrix_fast(img: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Apply 3x3 color matrix using numba kernel."""
+    h, w, _ = img.shape
+    flat = img.reshape(-1, 3).astype(np.float64)
+    out = np.empty_like(flat)
+    m = matrix
+    _color_matrix_kernel(flat, out, flat.shape[0],
+                         m[0, 0], m[0, 1], m[0, 2],
+                         m[1, 0], m[1, 1], m[1, 2],
+                         m[2, 0], m[2, 1], m[2, 2])
+    return out.reshape(h, w, 3)
+
+
 def negadoctor(rgb: np.ndarray, params: dict) -> np.ndarray:
     """Apply the negadoctor algorithm to convert a negative to positive.
 
@@ -784,8 +893,6 @@ def negadoctor(rgb: np.ndarray, params: dict) -> np.ndarray:
       5. Gamma (paper grade)
       6. Soft-clip highlight rolloff
     """
-    THRESHOLD = 2.3283064365386963e-10  # 2^(-32), from darktable
-
     Dmin = params["Dmin"]
     wb_high = params["wb_high"]
     wb_low = params["wb_low"]
@@ -796,53 +903,35 @@ def negadoctor(rgb: np.ndarray, params: dict) -> np.ndarray:
     soft_clip = params["soft_clip"]
     exposure = params["exposure"]
 
-    # Precompute like darktable's commit_params
     black_effective = -exposure * (1.0 + black)
 
-    # Normalize 16-bit to [0,1], linearize from sRGB gamma, then convert
-    # to darktable's working space (linear Rec2020, D50 white point).
-    # darktable's colorin module does exactly this before negadoctor sees data.
+    h, w, _ = rgb.shape
     img = rgb.astype(np.float64) / 65535.0
-    img = srgb_to_linear(img)
-    img = apply_color_matrix(img, M_SRGB_TO_REC2020_D50)
 
-    result = np.empty_like(img, dtype=np.float64)
+    # sRGB to linear (numba parallel)
+    flat = img.reshape(-1, 3)
+    lin_flat = np.empty_like(flat)
+    _srgb_to_linear_kernel(flat, lin_flat, flat.shape[0])
 
-    for c in range(3):
-        # Step 1: Transmission to density ratio
-        density = Dmin[c] / np.maximum(img[:, :, c], THRESHOLD)
+    # Linear sRGB to Rec2020 D50 (numba parallel)
+    rec_flat = np.empty_like(lin_flat)
+    m = M_SRGB_TO_REC2020_D50
+    _color_matrix_kernel(lin_flat, rec_flat, flat.shape[0],
+                         m[0, 0], m[0, 1], m[0, 2],
+                         m[1, 0], m[1, 1], m[1, 2],
+                         m[2, 0], m[2, 1], m[2, 2])
 
-        # Step 2: Log density — note the NEGATION, this is what inverts the negative
-        # darktable: log_density[c] *= -LOG2_to_LOG10  (i.e. -log10(density))
-        log_density = np.log2(density) * -0.30103
+    # Negadoctor (numba parallel)
+    out_flat = np.empty_like(rec_flat)
+    _negadoctor_kernel(
+        rec_flat, out_flat, flat.shape[0],
+        Dmin[0], Dmin[1], Dmin[2],
+        wb_high[0], wb_high[1], wb_high[2],
+        wb_low[0], wb_low[1], wb_low[2],
+        D_max, offset, exposure, black_effective, gamma, soft_clip,
+    )
 
-        # Step 3: White balance correction in log space
-        # commit_params precomputes: wb_high[c] = p->wb_high[c] / p->D_max
-        #                            offset[c]  = p->wb_high[c] * p->offset * p->wb_low[c]
-        wb_high_normed = wb_high[c] / D_max
-        offset_precomp = wb_high[c] * offset * wb_low[c]
-        corrected = wb_high_normed * log_density + offset_precomp
-
-        # Step 4: Print exposure (10^corrected) + black point
-        # darktable: print_linear = -(exposure * 10^corrected + black)
-        print_linear = -(exposure * np.power(10.0, corrected) + black_effective)
-        print_linear = np.maximum(print_linear, 0.0)
-
-        # Step 5: Gamma (paper grade)
-        print_gamma = np.power(print_linear, gamma)
-
-        # Step 6: Soft-clip highlight rolloff
-        # For values above soft_clip, apply exponential compression
-        above = print_gamma > soft_clip
-        if np.any(above):
-            sc = soft_clip
-            excess = print_gamma[above] - sc
-            print_gamma[above] = sc + (1.0 - np.exp(-excess / (1.0 - sc))) * (1.0 - sc)
-
-        result[:, :, c] = print_gamma
-
-    # Return scene-referred linear float — sigmoid and sRGB encoding applied later
-    return result
+    return out_flat.reshape(h, w, 3)
 
 
 def process(

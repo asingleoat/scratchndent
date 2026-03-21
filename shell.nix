@@ -8,6 +8,7 @@ pkgs.mkShell {
       numpy
       pillow
       scikit-image
+      numba
     ]))
     exiftool
     imagemagick
