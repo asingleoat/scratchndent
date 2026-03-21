@@ -101,11 +101,11 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
 
 def make_defect_mask(
     ir: np.ndarray,
-    threshold: float = 0.35,
-    hair_sensitivity: float = 0.15,
-    min_area: int = 4,
-    dilate_radius: int = 3,
-    close_radius: int = 5,
+    threshold: float = 0.25,
+    hair_sensitivity: float = 0.10,
+    min_area: int = 3,
+    dilate_radius: int = 4,
+    close_radius: int = 6,
 ) -> np.ndarray:
     """Create a binary defect mask from the IR channel.
 
@@ -155,8 +155,8 @@ def make_defect_mask(
     deviation = np.clip(deviation, 0, 1).astype(np.float64)
 
     # Meijering filter detects ridge-like (tubular) structures at multiple
-    # scales — sigmas chosen to match hair widths at this resolution
-    line_response = meijering(deviation, sigmas=range(1, 4), black_ridges=False)
+    # scales — sigmas cover thin scratches (1) through thick hairs (8)
+    line_response = meijering(deviation, sigmas=range(1, 9), black_ridges=False)
     line_mask_small = (line_response > hair_sensitivity).astype(np.uint8) * 255
 
     # Scale back up to full resolution
@@ -167,7 +167,7 @@ def make_defect_mask(
     # (prevents false positives on film grain / image detail)
     with np.errstate(divide='ignore', invalid='ignore'):
         full_ratio = np.where(background > 0.01, ir_f / background, 1.0)
-    line_mask[full_ratio > 0.98] = 0
+    line_mask[full_ratio > 0.95] = 0
 
     # --- Combine both masks ---
 
@@ -850,11 +850,11 @@ def process(
     output_path: str,
     *,
     align: bool = True,
-    threshold: float = 0.35,
-    hair_sensitivity: float = 0.15,
-    min_area: int = 4,
-    dilate_radius: int = 3,
-    close_radius: int = 5,
+    threshold: float = 0.25,
+    hair_sensitivity: float = 0.10,
+    min_area: int = 3,
+    dilate_radius: int = 4,
+    close_radius: int = 6,
     inpaint_padding: int = 16,
     save_mask: bool = False,
     invert_xmp: str | None = None,

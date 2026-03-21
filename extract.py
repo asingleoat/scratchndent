@@ -98,8 +98,11 @@ def apply_ir_clean(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def process_full_res() -> np.ndarray:
-    """Load and process the current image at full resolution."""
+def ensure_ir_cleaned() -> np.ndarray:
+    """Load and IR-clean the current image at full resolution (no inversion).
+
+    Inversion is deferred to per-crop at export time for speed.
+    """
     global FULL_IMG, FULL_IMG_READY
     if FULL_IMG_READY:
         return FULL_IMG
@@ -121,13 +124,9 @@ def process_full_res() -> np.ndarray:
         else:
             set_progress("No defects found")
 
-    if INVERT_XMP:
-        set_progress("Inverting negative (negadoctor)...")
-        rgb = apply_inversion(rgb)
-
     FULL_IMG = rgb
     FULL_IMG_READY = True
-    set_progress("Full-res processing complete")
+    set_progress("IR cleaning complete")
     return FULL_IMG
 
 
@@ -163,27 +162,12 @@ def switch_to_image(idx: int) -> None:
         small_rgb = rgb
         small_ir = ir
 
-    # IR clean at preview resolution (skip inpainting — just for visual)
-    if IR_CLEAN and small_ir is not None:
-        print("  IR preview processing...")
-        # Alignment not needed at preview scale, just mask + simple infill
-        ir_aligned = align_ir(small_rgb, small_ir)
-        mask = make_defect_mask(ir_aligned)
-        if np.count_nonzero(mask) > 0:
-            # Use cv2 inpaint for speed at preview resolution
-            if small_rgb.dtype == np.uint16:
-                preview8 = (small_rgb >> 8).astype(np.uint8)
-            else:
-                preview8 = small_rgb
-            preview8 = cv2.inpaint(preview8, mask, 3, cv2.INPAINT_TELEA)
-            small_rgb = preview8  # now uint8, fine for preview
+    # Skip IR cleaning for preview — it's cosmetic and the full-res export
+    # handles it properly. This keeps small_rgb in uint16 for accurate inversion.
 
-    # Inversion at preview resolution
+    # Inversion at preview resolution (uint16 preserved for tonal accuracy)
     if INVERT_XMP:
         print("  Inverting (preview)...")
-        # Ensure uint16 for negadoctor
-        if small_rgb.dtype == np.uint8:
-            small_rgb = small_rgb.astype(np.uint16) * 257
         small_rgb = apply_inversion(small_rgb)
 
     # Generate JPEG — downscale processed result to preview size
@@ -917,14 +901,19 @@ def handle_export(body: dict) -> dict:
     exported = []
 
     set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
-    full = process_full_res()
+    cleaned = ensure_ir_cleaned()
 
     for i, r in enumerate(rects):
         set_progress(f"Cropping frame {i + 1}/{n_rects}...")
         cx, cy, w, h = r["cx"], r["cy"], r["w"], r["h"]
         angle = r.get("angle", 0)
 
-        cropped = crop_rotated_rect(full, cx, cy, w, h, angle)
+        cropped = crop_rotated_rect(cleaned, cx, cy, w, h, angle)
+
+        if INVERT_XMP:
+            set_progress(f"Inverting frame {i + 1}/{n_rects}...")
+            cropped = apply_inversion(cropped)
+
         out_name = f"{basename}_{i + 1:02d}.tif"
         out_path = OUTPUT_DIR / out_name
         # Don't overwrite existing files
