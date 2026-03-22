@@ -118,12 +118,9 @@ def ensure_loaded() -> None:
     h, w = rgb.shape[:2]
     set_progress(f"Loaded {w}x{h} image")
 
-    if IR_CLEAN and ir is not None:
-        set_progress("Aligning IR channel (full strip)...")
-        FULL_IR = align_ir(rgb, ir)
-        set_progress("IR aligned — defect cleaning deferred to export")
-    else:
-        FULL_IR = None
+    # Store raw IR for potential later use; alignment is deferred to export
+    # so we skip the cost entirely if the user unchecks IR clean.
+    FULL_IR = ir  # None if no IR page
 
     # Compute Dmin from full strip (rebate gives best estimate)
     if FILM_STOCK:
@@ -170,44 +167,27 @@ def switch_to_image(idx: int) -> None:
     HAS_IR = ir is not None
     print(f"  Image: {w}x{h}, {rgb.dtype}")
 
-    # Downscale for fast preview processing — use longer dimension for quality
-    proc_dim = max(PREVIEW_SIZE, 6000)
-    proc_scale = min(proc_dim / max(h, w), 1.0)
+    # Downscale for preview
     preview_scale = min(PREVIEW_SIZE / max(h, w), 1.0)
-    if proc_scale < 1.0:
-        pw, ph = int(w * proc_scale), int(h * proc_scale)
+    if preview_scale < 1.0:
+        pw, ph = int(w * preview_scale), int(h * preview_scale)
         small_rgb = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
-        if ir is not None:
-            small_ir = cv2.resize(ir, (pw, ph), interpolation=cv2.INTER_AREA)
-        else:
-            small_ir = None
     else:
         small_rgb = rgb
-        small_ir = ir
 
-    # Skip IR cleaning for preview — it's cosmetic and the full-res export
-    # handles it properly. This keeps small_rgb in uint16 for accurate inversion.
-
-    # Inversion at preview resolution (uint16 preserved for tonal accuracy)
-    # Compute Dmin from the full-res image for accurate preview, using rebate if set
-    if FILM_STOCK:
-        print("  Computing Dmin for preview...")
-        rebate_mask = make_rebate_mask(h, w)
-        preview_dmin = compute_dmin(rgb, rebate_mask=rebate_mask)
-        DMIN = preview_dmin  # cache for later use
-        print("  Inverting (preview)...")
-        small_rgb = apply_inversion(small_rgb)
-
-    # Generate JPEG — downscale processed result to preview size
+    # Preview just needs to be usable for identifying frames and selecting
+    # rebate — not a proper inversion. Simple invert + histogram equalization.
+    print("  Generating quick preview...")
     if small_rgb.dtype == np.uint16:
         preview8 = (small_rgb >> 8).astype(np.uint8)
     else:
         preview8 = small_rgb
-    # Further downscale if we processed at higher res than preview
-    if proc_scale > preview_scale:
-        final_w = int(w * preview_scale)
-        final_h = int(h * preview_scale)
-        preview8 = cv2.resize(preview8, (final_w, final_h), interpolation=cv2.INTER_AREA)
+    # Invert (negative → rough positive)
+    preview8 = 255 - preview8
+    # Per-channel CLAHE for local contrast (makes frames visible regardless of exposure)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    for c in range(3):
+        preview8[:, :, c] = clahe.apply(preview8[:, :, c])
     pil_img = Image.fromarray(preview8)
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=90)
@@ -386,6 +366,7 @@ def handle_export(body: dict) -> dict:
     default_base = Path(INPUT_PATH).stem
     basename = body.get("basename", default_base)
     rects = body.get("rects", [])
+    ir_clean = body.get("ir_clean", True)
     n_rects = len(rects)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -393,6 +374,12 @@ def handle_export(body: dict) -> dict:
 
     set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
     ensure_loaded()
+
+    # Align IR once if IR cleaning is requested and we have an IR channel
+    aligned_ir = None
+    if ir_clean and FULL_IR is not None:
+        set_progress("Aligning IR channel (full strip)...")
+        aligned_ir = align_ir(FULL_IMG, FULL_IR)
 
     for i, r in enumerate(rects):
         set_progress(f"Cropping frame {i + 1}/{n_rects}...")
@@ -402,9 +389,9 @@ def handle_export(body: dict) -> dict:
         cropped = crop_rotated_rect(FULL_IMG, cx, cy, w, h, angle)
 
         # Per-crop IR cleaning (detect + inpaint only the frame region)
-        if FULL_IR is not None:
+        if aligned_ir is not None:
             set_progress(f"IR cleaning frame {i + 1}/{n_rects}...")
-            ir_cropped = crop_rotated_rect(FULL_IR, cx, cy, w, h, angle)
+            ir_cropped = crop_rotated_rect(aligned_ir, cx, cy, w, h, angle)
             cropped = ir_clean_region(cropped, ir_cropped)
 
         if FILM_STOCK:

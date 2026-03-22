@@ -18,6 +18,7 @@ from scratchndent.film_measurement import (
 )
 from scratchndent.film_calibration import (
     apply_density_transform,
+    default_identity_coeffs,
     default_kodak_gold_coeffs,
     default_kodak_portra_coeffs,
     load_profile,
@@ -25,73 +26,11 @@ from scratchndent.film_calibration import (
 
 
 STOCK_DEFAULTS = {
-    "kodak_gold": default_kodak_gold_coeffs,
-    "kodak_portra": default_kodak_portra_coeffs,
+    "kodak_gold": default_identity_coeffs,
+    "kodak_portra": default_identity_coeffs,
 }
 
 
-def exposure_anchor(
-    net_density: np.ndarray,
-    neutral_mask: np.ndarray | None = None,
-) -> np.ndarray:
-    """Compute per-channel exposure anchor point.
-
-    Used for optional global exposure normalization. A neutral mask
-    (known grey area) gives the most accurate anchor; otherwise we
-    use the median density as a scene heuristic.
-    """
-    if neutral_mask is not None:
-        pixels = net_density[neutral_mask]
-        if len(pixels) > 0:
-            return np.median(pixels, axis=0)
-
-    flat = net_density.reshape(-1, 3)
-    return np.median(flat, axis=0)
-
-
-def apply_exposure_normalization(
-    net_density: np.ndarray,
-    anchor: np.ndarray,
-    target_anchor: np.ndarray,
-) -> np.ndarray:
-    """Affine shift in density space to normalize exposure.
-
-    This is equivalent to adjusting the exposure/white-balance in the
-    density domain, which is more physically correct than doing it
-    after RGB conversion.
-    """
-    delta = target_anchor - anchor
-    return net_density + delta[None, None, :]
-
-
-def apply_neutral_balance(
-    net_density: np.ndarray,
-    neutral_mask: np.ndarray | None = None,
-    target_neutral: np.ndarray | None = None,
-) -> np.ndarray:
-    """Balance channels so neutral areas have equal density.
-
-    In density space, a neutral (grey) subject should have roughly equal
-    density across channels after Dmin subtraction. Any residual per-channel
-    offset is from scene illuminant color cast or film response differences.
-
-    Parameters
-    ----------
-    net_density : HxWx3
-        Dmin-subtracted density.
-    neutral_mask : HxW bool, optional
-        Mask of known neutral areas. If None, uses median of the image.
-    target_neutral : (3,), optional
-        Target density for neutrals. Defaults to the mean across channels
-        of the measured neutral.
-    """
-    anchor = exposure_anchor(net_density, neutral_mask)
-
-    if target_neutral is None:
-        # Make neutrals equal by shifting to the channel mean
-        target_neutral = np.full(3, np.mean(anchor))
-
-    return apply_exposure_normalization(net_density, anchor, target_neutral)
 
 
 def compute_dmin(
@@ -127,7 +66,6 @@ def invert_negative(
     dark_rgb: np.ndarray | None = None,
     light_rgb: np.ndarray | None = None,
     rebate_mask: np.ndarray | None = None,
-    neutral_balance: bool = True,
     exposure_compensation: float = 0.0,
 ) -> np.ndarray:
     """Full film inversion: raw scan → scene-linear RGB.
@@ -150,8 +88,6 @@ def invert_negative(
     rebate_mask : HxW bool, optional
         Mask of unexposed rebate pixels for Dmin estimation. Only used
         if dmin is not provided.
-    neutral_balance : bool
-        If True, balance channels in density space for neutral rendition.
     exposure_compensation : float
         Density-domain exposure shift (positive = brighter output).
 
@@ -186,12 +122,7 @@ def invert_negative(
 
     net_D = subtract_dmin(D, dmin)
 
-    # Optional neutral balance in density domain
-    if neutral_balance:
-        print("  Applying neutral balance in density space...")
-        net_D = apply_neutral_balance(net_D)
-
-    # Optional exposure compensation (in density: negative = brighter)
+    # Optional exposure compensation (in density: positive = brighter)
     if exposure_compensation != 0.0:
         print(f"  Exposure compensation: {exposure_compensation:+.2f}")
         net_D = net_D - exposure_compensation
@@ -202,9 +133,10 @@ def invert_negative(
     print("  Applying stock+scanner density transform...")
     corrected_D = apply_density_transform(net_D, coeffs)
 
-    # Stage 4: Density → scene-linear
-    # D = -log10(T), so T = 10^(-D). Higher density = less light = darker.
-    scene_linear = np.power(10.0, -corrected_D)
-    scene_linear = np.maximum(scene_linear, 0.0)
+    # Stage 4: Net density IS the scene-linear signal.
+    # After Dmin subtraction, higher density = more exposure = brighter scene.
+    # The polynomial transform has already corrected for cross-channel coupling.
+    # Values are non-negative (clipped at Dmin subtraction).
+    scene_linear = np.maximum(corrected_D, 0.0)
 
     return scene_linear

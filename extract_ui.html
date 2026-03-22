@@ -63,6 +63,8 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-add">+ New selection</button>
     <button id="btn-rebate" title="Select an area of unexposed film (the orange strip between frames or at the edge of the strip) to calibrate base color removal">Set rebate</button>
     <button id="btn-clear" class="danger">Clear all</button>
+    <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
+    <label><input type="checkbox" id="chk-ir" checked> IR clean</label>
     <span style="flex:1"></span>
     <label>Base name:</label>
     <input id="basename" value="" style="width:100px">
@@ -606,7 +608,7 @@ document.getElementById('btn-export').addEventListener('click', async () => {
         const resp = await fetch('/export', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ basename, rects }),
+            body: JSON.stringify({ basename, rects, ir_clean: document.getElementById('chk-ir').checked }),
         });
         const result = await resp.json();
         statusEl.textContent = result.message;
