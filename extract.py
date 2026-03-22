@@ -37,30 +37,166 @@ from scratchndent.film_inversion import compute_dmin, invert_negative
 from scratchndent.film_render import render_to_display
 
 
-CONFIG_FILE = Path("scratchndent_config.json")
+CONFIG_FILE = Path("scratchndent_config.toml")
+
+# Default algorithm parameters — overridden by config file values.
+# Grouped by section for the TOML file.
+PARAM_DEFAULTS = {
+    # IR dust/scratch detection
+    "ir_threshold": 0.25,
+    "ir_hair_sensitivity": 0.10,
+    "ir_min_area": 3,
+    "ir_dilate_radius": 4,
+    "ir_close_radius": 6,
+    "ir_blur_size": 301,
+    "ir_max_coverage": 0.03,
+
+    # Inpainting
+    "inpaint_padding": 16,
+
+    # Film rendering
+    "render_contrast": 1.2,
+    "render_curve_k": 5.0,
+    "render_percentile_lo": 0.5,
+    "render_percentile_hi": 99.5,
+
+    # Film inversion
+    "exposure_compensation": 0.0,
+
+    # UI / preview
+    "preview_size": 2400,
+    "clahe_clip": 2.0,
+}
+
+# Comments for each parameter, written to TOML for self-documentation
+PARAM_COMMENTS = {
+    "ir_threshold": "Defect detection sensitivity (lower = more aggressive, default 0.25)",
+    "ir_hair_sensitivity": "Meijering line filter threshold for hairs/scratches (lower = more sensitive, default 0.10)",
+    "ir_min_area": "Minimum defect size in pixels to keep (default 3)",
+    "ir_dilate_radius": "Mask dilation radius — expands detected defects (default 4)",
+    "ir_close_radius": "Morphological close radius — fills gaps in large defects (default 6)",
+    "ir_blur_size": "Background estimation blur kernel size, must be odd (default 301)",
+    "ir_max_coverage": "Sanity cap: max fraction of image flagged as defects before giving up (default 0.03 = 3%)",
+    "inpaint_padding": "Context padding around each defect for inpainting (default 16)",
+    "render_contrast": "S-curve contrast strength: 1.0 = linear, 1.5 = moderate, 2.0 = punchy (default 1.2)",
+    "render_curve_k": "S-curve steepness multiplier (default 5.0)",
+    "render_percentile_lo": "Low percentile for display range normalization (default 0.5)",
+    "render_percentile_hi": "High percentile for display range normalization (default 99.5)",
+    "exposure_compensation": "Density-domain exposure shift: positive = brighter output (default 0.0)",
+    "preview_size": "Max preview dimension in pixels (default 2400)",
+    "clahe_clip": "CLAHE clip limit for preview contrast enhancement (default 2.0)",
+    "dmin": "Film base density [R, G, B] — set via rebate selection in the UI",
+    "ir_clean": "Enable IR dust/scratch removal (true/false)",
+    "aspect": "Last used aspect ratio for frame selection",
+}
+
+# Map flat keys to TOML sections
+PARAM_SECTIONS = {
+    "ir_threshold": "dust_removal",
+    "ir_hair_sensitivity": "dust_removal",
+    "ir_min_area": "dust_removal",
+    "ir_dilate_radius": "dust_removal",
+    "ir_close_radius": "dust_removal",
+    "ir_blur_size": "dust_removal",
+    "ir_max_coverage": "dust_removal",
+    "inpaint_padding": "dust_removal",
+    "render_contrast": "render",
+    "render_curve_k": "render",
+    "render_percentile_lo": "render",
+    "render_percentile_hi": "render",
+    "exposure_compensation": "inversion",
+}
 
 
 def load_config() -> dict:
-    """Load persisted settings from config file."""
+    """Load persisted settings from TOML config file.
+
+    Returns a flat dict — TOML sections are flattened by prefixing
+    section keys where needed, but top-level keys are kept as-is.
+    """
     if CONFIG_FILE.exists():
         try:
-            return json.loads(CONFIG_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
+            import tomllib
+            with open(CONFIG_FILE, "rb") as f:
+                raw = tomllib.load(f)
+            # Flatten sections into a flat dict
+            flat = {}
+            for k, v in raw.items():
+                if isinstance(v, dict):
+                    flat.update(v)
+                else:
+                    flat[k] = v
+            return flat
+        except (Exception,):
             pass
     return {}
 
 
+def _format_toml_value(v) -> str:
+    """Format a Python value as TOML."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, str):
+        return f'"{v}"'
+    if isinstance(v, list):
+        items = ", ".join(_format_toml_value(x) for x in v)
+        return f"[{items}]"
+    return repr(v)
+
+
 def save_config(updates: dict) -> None:
-    """Merge updates into the config file."""
+    """Merge updates into the TOML config file with comments."""
     cfg = load_config()
     cfg.update(updates)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+    # Build a complete config with all known keys.
+    # Keys present in cfg are written active; defaults are commented out.
+    lines = ["# scratchndent configuration", "# Edit values below or uncomment to override defaults", ""]
+
+    # Collect all known top-level keys (not in a section)
+    top_keys = ["dmin", "ir_clean", "aspect"]
+    for k in top_keys:
+        comment = PARAM_COMMENTS.get(k)
+        if comment:
+            lines.append(f"# {comment}")
+        if k in cfg:
+            lines.append(f"{k} = {_format_toml_value(cfg[k])}")
+        elif k in PARAM_DEFAULTS:
+            lines.append(f"# {k} = {_format_toml_value(PARAM_DEFAULTS[k])}")
+        lines.append("")
+
+    # Write sections with all params — active if in cfg, commented if default
+    for section_name in ["dust_removal", "inversion", "render"]:
+        section_keys = [k for k, s in PARAM_SECTIONS.items() if s == section_name]
+        if not section_keys:
+            continue
+        lines.append(f"[{section_name}]")
+        for k in section_keys:
+            comment = PARAM_COMMENTS.get(k)
+            if comment:
+                lines.append(f"# {comment}")
+            if k in cfg:
+                lines.append(f"{k} = {_format_toml_value(cfg[k])}")
+            else:
+                lines.append(f"# {k} = {_format_toml_value(PARAM_DEFAULTS[k])}")
+        lines.append("")
+
+    CONFIG_FILE.write_text("\n".join(lines))
+
+
+def get_param(name: str) -> float | int:
+    """Get a parameter value: config file overrides, then defaults."""
+    cfg = load_config()
+    if name in cfg:
+        return type(PARAM_DEFAULTS[name])(cfg[name])
+    return PARAM_DEFAULTS[name]
 
 
 # ---------------------------------------------------------------------------
 # Globals set at startup
 # ---------------------------------------------------------------------------
 INPUT_PATH: str = ""
+INPUT_DIR: Path = Path(".")               # directory to scan for images
 OUTPUT_DIR: Path = Path(".")
 FULL_IMG: np.ndarray | None = None       # full-res raw RGB (lazy, None until export)
 FULL_IR: np.ndarray | None = None        # full-res aligned IR (None if no IR)
@@ -74,7 +210,6 @@ IMAGE_LIST: list[str] = []               # all image paths in folder
 IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
 FILM_STOCK: str | None = None              # film stock for inversion (None = no inversion)
 FILM_PROFILE: str | None = None            # path to calibration profile (overrides stock)
-FILM_CONTRAST: float = 1.6                 # rendering contrast
 IR_CLEAN: bool = True                     # auto-detect by default
 PREVIEW_SIZE: int = 2400
 LOADING: bool = False                     # True while switching images
@@ -120,10 +255,14 @@ def apply_inversion(img: np.ndarray) -> np.ndarray:
         dmin=DMIN,
         stock=FILM_STOCK or "kodak_gold",
         profile_path=FILM_PROFILE,
+        exposure_compensation=get_param("exposure_compensation"),
     )
     return render_to_display(
         scene_linear,
-        contrast=FILM_CONTRAST,
+        contrast=get_param("render_contrast"),
+        curve_k=get_param("render_curve_k"),
+        percentile_lo=get_param("render_percentile_lo"),
+        percentile_hi=get_param("render_percentile_hi"),
     )
 
 
@@ -170,13 +309,42 @@ def ir_clean_region(
     rgb_region: np.ndarray,
     ir_region: np.ndarray,
 ) -> np.ndarray:
-    """Detect and inpaint defects in a cropped region."""
-    mask = make_defect_mask(ir_region, rgb=rgb_region)
-    n_defects = np.count_nonzero(mask)
-    if n_defects > 0:
-        print(f"    {n_defects} defect pixels in region")
-        return inpaint(rgb_region, mask)
-    return rgb_region
+    """Detect defects at IR resolution, inpaint at RGB resolution.
+
+    Handles different resolutions between RGB and IR — the mask is
+    computed at IR resolution then upscaled to RGB resolution for
+    inpainting at full detail.
+    """
+    rgb_h, rgb_w = rgb_region.shape[:2]
+    ir_h, ir_w = ir_region.shape[:2]
+
+    # Detect defects at IR resolution using config parameters
+    mask_ir = make_defect_mask(
+        ir_region,
+        threshold=get_param("ir_threshold"),
+        hair_sensitivity=get_param("ir_hair_sensitivity"),
+        min_area=get_param("ir_min_area"),
+        dilate_radius=get_param("ir_dilate_radius"),
+        close_radius=get_param("ir_close_radius"),
+        blur_size=get_param("ir_blur_size"),
+        max_coverage=get_param("ir_max_coverage"),
+    )
+    n_defects = np.count_nonzero(mask_ir)
+    if n_defects == 0:
+        return rgb_region
+
+    # Upscale mask to RGB resolution if needed
+    if rgb_h != ir_h or rgb_w != ir_w:
+        mask = cv2.resize(mask_ir, (rgb_w, rgb_h),
+                          interpolation=cv2.INTER_NEAREST)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(mask, kernel)
+    else:
+        mask = mask_ir
+
+    n_final = np.count_nonzero(mask)
+    print(f"    {n_defects} defect pixels (IR) → {n_final} pixels (RGB)")
+    return inpaint(rgb_region, mask, padding=get_param("inpaint_padding"))
 
 
 def switch_to_image(idx: int) -> None:
@@ -214,9 +382,25 @@ def switch_to_image(idx: int) -> None:
         preview8 = (small_rgb >> 8).astype(np.uint8)
     else:
         preview8 = small_rgb
+    # Mask out sprocket holes before inversion — they're near-white in the
+    # raw scan (full scanner light, no film) and would become black after
+    # inversion, skewing the contrast stretch.
+    gray_raw = cv2.cvtColor(preview8, cv2.COLOR_RGB2GRAY)
+    content_mask = gray_raw < 240  # exclude sprocket holes / scanner light
+
     # Invert (negative → rough positive)
     preview8 = 255 - preview8
-    # Per-channel CLAHE for local contrast (makes frames visible regardless of exposure)
+
+    # Per-channel contrast stretch using only film content pixels
+    if np.count_nonzero(content_mask) > 100:
+        for c in range(3):
+            ch = preview8[:, :, c]
+            lo = np.percentile(ch[content_mask], 1)
+            hi = np.percentile(ch[content_mask], 99)
+            if hi > lo:
+                preview8[:, :, c] = np.clip(
+                    (ch.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255
+                ).astype(np.uint8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     for c in range(3):
         preview8[:, :, c] = clahe.apply(preview8[:, :, c])
@@ -238,7 +422,7 @@ def load_image(path: str) -> tuple[np.ndarray, np.ndarray | None]:
             img = tif.pages[0].asarray()
             if len(tif.pages) >= 3:
                 ir_page = tif.pages[2].asarray()
-                if ir_page.ndim == 2 and ir_page.shape[:2] == img.shape[:2]:
+                if ir_page.ndim == 2:
                     ir = ir_page
     else:
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -335,6 +519,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_config()
             self._respond(200, "application/json", json.dumps(cfg).encode())
         elif parsed.path == "/images":
+            rescan_images()
             data = {
                 "images": [Path(p).name for p in IMAGE_LIST],
                 "current": IMAGE_IDX,
@@ -377,16 +562,25 @@ class Handler(BaseHTTPRequestHandler):
                 "h": int(body["h"]),
             }
             print(f"  Rebate set: {REBATE_RECT}")
-            # Compute Dmin from the rebate region and persist
-            if FULL_IMG is not None and FILM_STOCK:
-                global DMIN
+            # Compute Dmin from the rebate region. Use cached full image
+            # if available, otherwise read just the region from disk.
+            global DMIN
+            if FILM_STOCK:
                 r = REBATE_RECT
-                rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+                if FULL_IMG is not None:
+                    rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+                else:
+                    print(f"  Reading rebate region from {INPUT_PATH}...")
+                    with tifffile.TiffFile(INPUT_PATH) as tif:
+                        page = tif.pages[0]
+                        full = page.asarray()
+                        rebate_rgb = full[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]].copy()
+                        del full
                 DMIN = compute_dmin(rebate_rgb)
                 print(f"  Dmin updated: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
                 save_config({"dmin": DMIN.tolist()})
             self._respond(200, "application/json",
-                          json.dumps({"ok": True}).encode())
+                          json.dumps({"ok": True, "dmin": DMIN.tolist() if DMIN is not None else None}).encode())
         elif self.path == "/settings":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -424,9 +618,15 @@ def handle_export(body: dict) -> dict:
 
     # Align IR once if IR cleaning is requested and we have an IR channel
     aligned_ir = None
+    ir_scale_x = ir_scale_y = 1.0
     if ir_clean and FULL_IR is not None:
         set_progress("Aligning IR channel (full strip)...")
         aligned_ir = align_ir(FULL_IMG, FULL_IR)
+        # Compute scale factor from RGB to IR coordinates
+        rgb_h, rgb_w = FULL_IMG.shape[:2]
+        ir_h, ir_w = aligned_ir.shape[:2]
+        ir_scale_x = ir_w / rgb_w
+        ir_scale_y = ir_h / rgb_h
 
     for i, r in enumerate(rects):
         set_progress(f"Cropping frame {i + 1}/{n_rects}...")
@@ -435,15 +635,29 @@ def handle_export(body: dict) -> dict:
 
         cropped = crop_rotated_rect(FULL_IMG, cx, cy, w, h, angle)
 
-        # Per-crop IR cleaning (detect + inpaint only the frame region)
+        # Per-crop IR cleaning — crop IR at its own resolution
         if aligned_ir is not None:
             set_progress(f"IR cleaning frame {i + 1}/{n_rects}...")
-            ir_cropped = crop_rotated_rect(aligned_ir, cx, cy, w, h, angle)
+            ir_cropped = crop_rotated_rect(
+                aligned_ir,
+                cx * ir_scale_x, cy * ir_scale_y,
+                w * ir_scale_x, h * ir_scale_y,
+                angle,
+            )
             cropped = ir_clean_region(cropped, ir_cropped)
 
         if FILM_STOCK:
             set_progress(f"Inverting frame {i + 1}/{n_rects}...")
             cropped = apply_inversion(cropped)
+
+        # Apply output rotation (0, 90, 180, 270 degrees CW)
+        rotation = r.get("rotation", 0)
+        if rotation == 90:
+            cropped = np.rot90(cropped, k=-1)
+        elif rotation == 180:
+            cropped = np.rot90(cropped, k=2)
+        elif rotation == 270:
+            cropped = np.rot90(cropped, k=1)
 
         out_name = f"{basename}_{i + 1:02d}.tif"
         out_path = OUTPUT_DIR / out_name
@@ -459,7 +673,7 @@ def handle_export(body: dict) -> dict:
         meta = {
             "source": Path(INPUT_PATH).name,
             "stock": FILM_STOCK,
-            "contrast": FILM_CONTRAST,
+            "contrast": get_param("render_contrast"),
             "ir_clean": ir_clean and aligned_ir is not None,
             "dmin": DMIN.tolist() if DMIN is not None else None,
             "rebate_rect": REBATE_RECT,
@@ -480,6 +694,18 @@ def handle_export(body: dict) -> dict:
 TIFF_EXTS = {".tif", ".tiff"}
 
 
+def rescan_images() -> None:
+    """Re-scan the input directory for new/removed files."""
+    global IMAGE_LIST, IMAGE_IDX
+    old_current = IMAGE_LIST[IMAGE_IDX] if IMAGE_IDX < len(IMAGE_LIST) else None
+    IMAGE_LIST = find_images(INPUT_DIR)
+    # Try to keep the current image selected
+    if old_current and old_current in IMAGE_LIST:
+        IMAGE_IDX = IMAGE_LIST.index(old_current)
+    elif IMAGE_IDX >= len(IMAGE_LIST):
+        IMAGE_IDX = max(0, len(IMAGE_LIST) - 1)
+
+
 def find_images(path: Path) -> list[str]:
     """Find all TIFFs in a directory, sorted by name."""
     if path.is_file():
@@ -494,7 +720,7 @@ def find_images(path: Path) -> list[str]:
 
 
 def main():
-    global OUTPUT_DIR, IMAGE_LIST, FILM_STOCK, FILM_PROFILE, FILM_CONTRAST
+    global OUTPUT_DIR, INPUT_DIR, IMAGE_LIST, FILM_STOCK, FILM_PROFILE
     global IR_CLEAN, PREVIEW_SIZE, DMIN
 
     parser = argparse.ArgumentParser(
@@ -519,8 +745,8 @@ def main():
         help="Path to calibration profile JSON (overrides --stock)",
     )
     parser.add_argument(
-        "--contrast", type=float, default=1.6,
-        help="Rendering contrast (default: 1.6, range ~0.8-2.0)",
+        "--contrast", type=float, default=1.2,
+        help="Rendering contrast S-curve (default: 1.2, range 1.0-2.0)",
     )
     parser.add_argument(
         "--no-ir-clean", action="store_true",
@@ -531,7 +757,9 @@ def main():
     OUTPUT_DIR = Path(args.output_dir)
     FILM_STOCK = args.stock
     FILM_PROFILE = args.profile
-    FILM_CONTRAST = args.contrast
+    # Save CLI contrast override to config if explicitly set
+    if args.contrast != 1.2:
+        save_config({"render_contrast": args.contrast})
 
     # Load persisted settings from config file
     cfg = load_config()
@@ -542,6 +770,7 @@ def main():
     PREVIEW_SIZE = args.preview_size
 
     input_path = Path(args.input)
+    INPUT_DIR = input_path.parent if input_path.is_file() else input_path
     IMAGE_LIST = find_images(input_path)
     if not IMAGE_LIST:
         sys.exit(f"No TIFF files found in {input_path}")

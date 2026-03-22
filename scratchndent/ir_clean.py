@@ -21,7 +21,11 @@ from skimage.restoration import inpaint_biharmonic
 
 
 def load_tiff(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load RGB (page 0) and IR (page 2) from a SilverFast multi-page TIFF."""
+    """Load RGB (page 0) and IR (page 2) from a SilverFast multi-page TIFF.
+
+    RGB and IR may have different resolutions (e.g. 6400 DPI RGB with
+    3200 DPI IR). Downstream functions handle the mismatch.
+    """
     with tifffile.TiffFile(path) as tif:
         pages = tif.pages
         if len(pages) < 3:
@@ -30,11 +34,10 @@ def load_tiff(path: str) -> tuple[np.ndarray, np.ndarray]:
         rgb = pages[0].asarray()  # (H, W, 3) uint16
         ir = pages[2].asarray()   # (H, W) uint16
 
-    if rgb.shape[:2] != ir.shape[:2]:
-        sys.exit(
-            f"RGB shape {rgb.shape[:2]} != IR shape {ir.shape[:2]}; "
-            "cannot process mismatched dimensions"
-        )
+    rgb_h, rgb_w = rgb.shape[:2]
+    ir_h, ir_w = ir.shape[:2]
+    if rgb_h != ir_h or rgb_w != ir_w:
+        print(f"  Note: RGB {rgb_w}x{rgb_h} and IR {ir_w}x{ir_h} differ in resolution")
 
     return rgb, ir
 
@@ -42,10 +45,20 @@ def load_tiff(path: str) -> tuple[np.ndarray, np.ndarray]:
 def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
     """Align IR channel to RGB using ECC (Enhanced Correlation Coefficient).
 
-    Works on downsampled 8-bit grayscale versions for speed, then applies
-    the recovered warp to the full-resolution IR.
+    Handles different resolutions between RGB and IR (e.g. 6400 DPI RGB
+    with 3200 DPI IR). Alignment is computed by downsampling RGB to match
+    IR resolution, then the offset is applied to IR in its native resolution.
+
+    Returns the aligned IR at its original (possibly lower) resolution.
     """
-    # Convert to 8-bit for ECC speed
+    rgb_h, rgb_w = rgb.shape[:2]
+    ir_h, ir_w = ir.shape[:2]
+
+    # Resolution ratio between RGB and IR
+    res_ratio_y = rgb_h / ir_h
+    res_ratio_x = rgb_w / ir_w
+
+    # Convert to 8-bit
     if rgb.dtype == np.uint8:
         rgb8 = rgb
     else:
@@ -56,11 +69,16 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
         ir8 = (ir / (ir.max() / 255.0 + 1e-10)).astype(np.uint8)
     gray = cv2.cvtColor(rgb8, cv2.COLOR_RGB2GRAY)
 
-    # Downsample for speed — ECC on a 100+ megapixel image is slow
-    scale = 0.125
-    small_gray = cv2.resize(gray, None, fx=scale, fy=scale,
+    # Downsample RGB to match IR resolution for alignment
+    if abs(res_ratio_x - 1.0) > 0.01 or abs(res_ratio_y - 1.0) > 0.01:
+        print(f"  Downsampling RGB {rgb_w}x{rgb_h} to match IR {ir_w}x{ir_h} for alignment")
+        gray = cv2.resize(gray, (ir_w, ir_h), interpolation=cv2.INTER_AREA)
+
+    # Further downsample both for ECC speed
+    ecc_scale = 0.125
+    small_gray = cv2.resize(gray, None, fx=ecc_scale, fy=ecc_scale,
                             interpolation=cv2.INTER_AREA)
-    small_ir = cv2.resize(ir8, None, fx=scale, fy=scale,
+    small_ir = cv2.resize(ir8, None, fx=ecc_scale, fy=ecc_scale,
                           interpolation=cv2.INTER_AREA)
 
     warp_matrix = np.eye(2, 3, dtype=np.float32)
@@ -80,19 +98,18 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
               file=sys.stderr)
         return ir
 
-    # Scale translation back to full resolution
-    warp_matrix[0, 2] /= scale
-    warp_matrix[1, 2] /= scale
+    # Scale translation back to IR resolution (not RGB resolution)
+    warp_matrix[0, 2] /= ecc_scale
+    warp_matrix[1, 2] /= ecc_scale
 
     tx, ty = warp_matrix[0, 2], warp_matrix[1, 2]
-    print(f"IR alignment offset: tx={tx:.2f}px, ty={ty:.2f}px")
+    print(f"IR alignment offset (IR pixels): tx={tx:.2f}px, ty={ty:.2f}px")
 
     if abs(tx) < 0.5 and abs(ty) < 0.5:
         print("Offset negligible, skipping warp")
         return ir
 
-    # Use scipy shift for sub-pixel translation — avoids OpenCV's SHRT_MAX
-    # limit on images taller/wider than 32767 pixels.
+    # Apply shift at IR resolution
     from scipy.ndimage import shift as ndimage_shift
     aligned = ndimage_shift(ir, (-ty, -tx), order=1, mode='reflect')
     return aligned
@@ -106,6 +123,8 @@ def make_defect_mask(
     min_area: int = 3,
     dilate_radius: int = 4,
     close_radius: int = 6,
+    blur_size: int = 301,
+    max_coverage: float = 0.03,
 ) -> np.ndarray:
     """Create a binary defect mask from the IR channel.
 
@@ -128,7 +147,6 @@ def make_defect_mask(
     # --- Adaptive ratio-based detection ---
 
     # Large blur for local background estimate
-    blur_size = 301
     background = cv2.GaussianBlur(ir_f, (blur_size, blur_size), 0)
 
     # Local standard deviation for adaptive thresholding
@@ -148,8 +166,8 @@ def make_defect_mask(
         ratio = np.where(background > 0.01, ir_f / background, 1.0)
 
     # Threshold on n_sigma (adaptive) AND ratio (absolute floor)
-    sigma_threshold = 3.0 / threshold  # threshold=0.25 → 12 sigma
-    coarse_mask = (n_sigma > sigma_threshold) & (ratio < (1.0 - threshold))
+    sigma_threshold = 2.5 / threshold  # threshold=0.25 → 10 sigma
+    coarse_mask = (n_sigma > sigma_threshold) & (ratio < (1.0 - threshold * 0.7))
 
     # Two-pass: replace detected defects with background, re-estimate
     ir_cleaned = ir_f.copy()
@@ -163,7 +181,7 @@ def make_defect_mask(
         n_sigma2 = np.where(local_std2 > 1e-4, deficit2 / local_std2, 0.0)
         ratio2 = np.where(background2 > 0.01, ir_f / background2, 1.0)
 
-    dust_mask = (n_sigma2 > sigma_threshold) & (ratio2 < (1.0 - threshold))
+    dust_mask = (n_sigma2 > sigma_threshold) & (ratio2 < (1.0 - threshold * 0.7))
 
     n_dust = np.count_nonzero(dust_mask)
     print(f"    Dust detection: {n_dust} pixels ({100*n_dust/dust_mask.size:.2f}%)")
@@ -190,7 +208,7 @@ def make_defect_mask(
                            interpolation=cv2.INTER_NEAREST)
 
     # Gate: only keep line detections where there's a meaningful IR deficit
-    line_mask[n_sigma2 < sigma_threshold * 0.3] = 0
+    line_mask[n_sigma2 < sigma_threshold * 0.2] = 0
 
     n_lines = np.count_nonzero(line_mask)
     print(f"    Line detection: {n_lines} pixels ({100*n_lines/line_mask.size:.2f}%)")
@@ -225,7 +243,7 @@ def make_defect_mask(
 
     # Sanity check
     coverage = np.count_nonzero(mask) / mask.size
-    if coverage > 0.03:
+    if coverage > max_coverage:
         print(f"WARNING: defect mask covers {100*coverage:.1f}% of image — "
               f"returning empty mask.", file=sys.stderr)
         return np.zeros_like(mask)

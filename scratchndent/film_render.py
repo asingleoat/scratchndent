@@ -90,57 +90,70 @@ def apply_srgb_gamma(linear: np.ndarray) -> np.ndarray:
 def render_to_display(
     scene_linear: np.ndarray,
     *,
-    contrast: float = 1.6,
+    contrast: float = 1.2,
     black_point: float = 0.0,
+    curve_k: float = 5.0,
+    percentile_lo: float = 0.5,
+    percentile_hi: float = 99.5,
 ) -> np.ndarray:
-    """Full display rendering pipeline: scene-linear → sRGB uint16.
+    """Render corrected density values to display-ready sRGB uint16.
 
-    The sigmoid tone mapper's midpoint is set to the image's median
-    luminance so the S-curve is centered on the actual content,
-    spreading tones evenly across the display range.
+    Density values are already in a perceptual/log space (similar to
+    gamma-encoded), so we do NOT apply sRGB gamma — that would double-
+    encode and push everything too bright.
+
+    The pipeline:
+    1. Normalize density range to [0, 1] using robust percentiles
+    2. Apply an S-curve for contrast (expands midtones, compresses extremes)
+    3. Scale to uint16
 
     Parameters
     ----------
     scene_linear : HxWx3 float64
-        Scene-linear RGB from film inversion (net density values).
+        Corrected net density from film inversion. Higher = brighter scene.
     contrast : float
-        Sigmoid contrast. 1.0 = flat, 1.5 = punchy, 2.0 = high contrast.
+        S-curve strength. 1.0 = linear (no contrast boost), 1.5 = moderate,
+        2.0 = high contrast. Default 1.4.
     black_point : float
         Display black level (0.0 = full black).
 
     Returns
     -------
     display_rgb : HxWx3 uint16
-        sRGB-encoded 16-bit display image.
+        Display-ready 16-bit image.
     """
     img = scene_linear.copy()
 
-    # Map the actual data range to [0, 1] using robust percentiles,
-    # then apply a gamma curve for contrast. This is content-independent —
-    # it uses the full display range regardless of scene content.
+    # Map the actual data range to [0, 1] using robust percentiles
     luminance = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
     pos = luminance[luminance > 0.001]
     if len(pos) > 0:
-        lo = float(np.percentile(pos, 0.5))
-        hi = float(np.percentile(pos, 99.5))
+        lo = float(np.percentile(pos, percentile_lo))
+        hi = float(np.percentile(pos, percentile_hi))
     else:
         lo, hi = 0.0, 1.0
     if hi <= lo:
         hi = lo + 1.0
     print(f"  Data range: {lo:.4f} - {hi:.4f}")
 
-    # Normalize to [0, 1] per-channel using the luminance-derived range
+    # Normalize to [0, 1]
     display = (img - lo) / (hi - lo)
     display = np.clip(display, 0.0, 1.0)
 
-    # Apply contrast curve: gamma < 1 pushes midtones darker (more contrast),
-    # gamma > 1 lifts shadows. The 'contrast' parameter maps to gamma as
-    # 1/contrast so that higher contrast = darker midtones = more punch.
-    gamma = 1.0 / contrast
-    print(f"  Applying contrast curve (gamma={gamma:.3f})...")
-    display = np.power(display, gamma)
+    # S-curve for contrast: centered at 0.5, symmetric, adjustable strength.
+    # Maps [0,1] → [0,1] with midtones expanded and extremes compressed.
+    # At contrast=1.0 this is the identity. Higher values add punch.
+    if contrast != 1.0:
+        # Attempt the logistic S-curve: y = 1 / (1 + exp(-k*(x - 0.5)))
+        # scaled so that (0,0) and (1,1) are preserved.
+        k = contrast * curve_k  # map contrast to steepness
+        raw = 1.0 / (1.0 + np.exp(-k * (display - 0.5)))
+        # Normalize so endpoints map to [0, 1]
+        raw_lo = 1.0 / (1.0 + np.exp(-k * (0.0 - 0.5)))
+        raw_hi = 1.0 / (1.0 + np.exp(-k * (1.0 - 0.5)))
+        display = (raw - raw_lo) / (raw_hi - raw_lo)
+        print(f"  S-curve contrast (k={k:.1f})")
 
-    print("  Applying sRGB gamma...")
-    display = apply_srgb_gamma(display)
-
+    # No sRGB gamma — density values are already perceptually spaced
+    display = np.clip(display, 0.0, 1.0)
     return np.clip(display * 65535.0, 0, 65535).astype(np.uint16)

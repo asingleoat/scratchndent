@@ -53,12 +53,27 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <label>Aspect:</label>
     <select id="aspect">
         <option value="free">Free</option>
-        <option value="3:2" selected>3:2</option>
-        <option value="2:3">2:3</option>
-        <option value="4:3">4:3</option>
-        <option value="3:4">3:4</option>
-        <option value="5:4">5:4</option>
         <option value="1:1">1:1</option>
+        <optgroup label="Landscape">
+        <option value="3:2" selected>3:2</option>
+        <option value="4:3">4:3</option>
+        <option value="5:4">5:4</option>
+        <option value="6:4.5">6:4.5 (645)</option>
+        <option value="7:6">7:6</option>
+        <option value="9:6">9:6</option>
+        <option value="16:9">16:9</option>
+        <option value="17:6">17:6 (pano)</option>
+        </optgroup>
+        <optgroup label="Portrait">
+        <option value="2:3">2:3</option>
+        <option value="3:4">3:4</option>
+        <option value="4:5">4:5</option>
+        <option value="4.5:6">4.5:6 (645)</option>
+        <option value="6:7">6:7</option>
+        <option value="6:9">6:9</option>
+        <option value="9:16">9:16</option>
+        <option value="6:17">6:17 (pano)</option>
+        </optgroup>
     </select>
     <button id="btn-add">+ New selection</button>
     <button id="btn-rebate" title="Select an area of unexposed film (the orange strip between frames or at the edge of the strip) to calibrate base color removal">Set rebate</button>
@@ -118,17 +133,25 @@ const imgSelect = document.getElementById('img-select');
 const basenameEl = document.getElementById('basename');
 const overlay = document.getElementById('loading-overlay');
 
-// Populate image dropdown
-fetch('/images').then(r => r.json()).then(data => {
-    imgSelect.innerHTML = '';
-    data.images.forEach((name, i) => {
-        const opt = document.createElement('option');
-        opt.value = i;
-        opt.textContent = `${i + 1}/${data.images.length}: ${name}`;
-        imgSelect.appendChild(opt);
+// Populate image dropdown — called on startup and refreshed on interaction
+function refreshImageList() {
+    return fetch('/images').then(r => r.json()).then(data => {
+        imgSelect.innerHTML = '';
+        data.images.forEach((name, i) => {
+            const opt = document.createElement('option');
+            opt.value = i;
+            opt.textContent = `${i + 1}/${data.images.length}: ${name}`;
+            imgSelect.appendChild(opt);
+        });
+        imageCount = data.images.length;
+        imgSelect.value = data.current;
+        return data;
     });
-    imgSelect.value = data.current;
-});
+}
+refreshImageList();
+
+// Rescan directory when dropdown is opened
+imgSelect.addEventListener('focus', () => refreshImageList());
 
 imgSelect.addEventListener('change', () => {
     const idx = parseInt(imgSelect.value);
@@ -164,8 +187,8 @@ function updateImageInfo(info) {
     imgSelect.value = imageIdx;
     basenameEl.value = name.replace(/\.[^.]+$/, '');
     statusEl.textContent = `${name} | ${info.full_width}x${info.full_height} | Preview scale: ${previewScale.toFixed(3)}`;
-    document.getElementById('btn-prev').disabled = imageIdx <= 0;
-    document.getElementById('btn-next').disabled = imageIdx >= imageCount - 1;
+    document.getElementById('btn-prev').disabled = false;
+    document.getElementById('btn-next').disabled = false;
 }
 
 fetch('/info').then(r => r.json()).then(updateImageInfo);
@@ -233,8 +256,9 @@ function getAspect() {
 
 // --- Selection model ---
 let lastAngle = 0, lastW = 0, lastH = 0;
+let lastRotation = 270; // default: 270° CW (scanner vertical, photos landscape)
 function addSelection(x, y, w, h, angle = lastAngle) {
-    selections.push({ x, y, w, h, angle });
+    selections.push({ x, y, w, h, angle, rotation: lastRotation });
     activeIdx = selections.length - 1;
     updateSelList();
 }
@@ -245,12 +269,23 @@ function updateSelList() {
         const div = document.createElement('div');
         div.className = 'sel-item' + (i === activeIdx ? ' active' : '');
         const fw = (s.w / previewScale)|0, fh = (s.h / previewScale)|0;
-        div.innerHTML = `<span class="del" data-i="${i}">&times;</span>#${i + 1}: ${fw}&times;${fh}`;
+        const rot = s.rotation || 0;
+        div.innerHTML = `<span class="del" data-i="${i}">&times;</span>#${i + 1}: ${fw}&times;${fh}`
+            + `<label style="display:block;font-size:11px;margin-top:3px;color:#aaa">rotate: `
+            + `<select class="sel-rot" data-i="${i}" style="font-size:11px;background:#333;color:#eee;border:1px solid #555;border-radius:3px">`
+            + `<option value="0" ${rot===0?'selected':''}>0&deg;</option>`
+            + `<option value="90" ${rot===90?'selected':''}>90&deg; CW</option>`
+            + `<option value="180" ${rot===180?'selected':''}>180&deg;</option>`
+            + `<option value="270" ${rot===270?'selected':''}>270&deg; CW</option>`
+            + `</select></label>`;
         div.addEventListener('click', (e) => {
             if (e.target.classList.contains('del')) {
                 selections.splice(i, 1);
                 if (activeIdx >= selections.length) activeIdx = selections.length - 1;
                 updateSelList(); render();
+            } else if (e.target.classList.contains('sel-rot')) {
+                s.rotation = parseInt(e.target.value);
+                lastRotation = s.rotation;
             } else {
                 activeIdx = i; updateSelList(); render();
             }
@@ -353,12 +388,12 @@ function render() {
 
         // Rectangle
         const sw = s.w * scale, sh = s.h * scale;
-        ctx.strokeStyle = isActive ? '#2d6' : '#fff';
-        ctx.lineWidth = isActive ? 2 : 1;
+        ctx.strokeStyle = isActive ? '#2d6' : '#f90';
+        ctx.lineWidth = isActive ? 2 : 1.5;
         ctx.strokeRect(-sw / 2, -sh / 2, sw, sh);
 
         // Semi-transparent fill
-        ctx.fillStyle = isActive ? 'rgba(34,221,102,0.08)' : 'rgba(255,255,255,0.05)';
+        ctx.fillStyle = isActive ? 'rgba(34,221,102,0.08)' : 'rgba(255,153,0,0.08)';
         ctx.fillRect(-sw / 2, -sh / 2, sw, sh);
 
         if (isActive) {
@@ -533,9 +568,8 @@ canvas.addEventListener('mouseup', () => {
                     w: rebateRect.w / previewScale,
                     h: rebateRect.h / previewScale,
                 }),
-            }).then(() => {
-                // Refresh Dmin display
-                fetch('/settings').then(r => r.json()).then(cfg => updateDminDisplay(cfg.dmin || null));
+            }).then(r => r.json()).then(data => {
+                updateDminDisplay(data.dmin || null);
             });
         } else {
             rebateRect = null;
@@ -590,12 +624,19 @@ canvas.addEventListener('mouseup', (e) => {
 // --- Buttons ---
 document.getElementById('btn-add').addEventListener('click', () => {
     let w, h;
+    const aspect = getAspect();
     if (lastW > 0 && lastH > 0) {
-        w = lastW; h = lastH;
+        // Inherit size from previous selection, but apply current aspect ratio
+        const area = lastW * lastH;
+        if (aspect) {
+            w = Math.sqrt(area * aspect);
+            h = w / aspect;
+        } else {
+            w = lastW; h = lastH;
+        }
     } else {
-        const aspect = getAspect() || 1.5;
         h = imgH * 0.3;
-        w = h * aspect;
+        w = h * (aspect || 1.5);
     }
     // Place in center of current viewport
     const vcx = (canvas.width / 2 - offsetX) / scale;
@@ -611,10 +652,14 @@ document.getElementById('btn-rebate').addEventListener('click', () => {
 });
 
 document.getElementById('btn-prev').addEventListener('click', () => {
-    if (imageIdx > 0) switchImage(imageIdx - 1);
+    refreshImageList().then(() => {
+        switchImage(imageIdx > 0 ? imageIdx - 1 : imageCount - 1);
+    });
 });
 document.getElementById('btn-next').addEventListener('click', () => {
-    if (imageIdx < imageCount - 1) switchImage(imageIdx + 1);
+    refreshImageList().then(() => {
+        switchImage(imageIdx < imageCount - 1 ? imageIdx + 1 : 0);
+    });
 });
 
 document.getElementById('btn-clear').addEventListener('click', () => {
@@ -644,6 +689,7 @@ document.getElementById('btn-export').addEventListener('click', async () => {
         w: s.w / previewScale,
         h: s.h / previewScale,
         angle: s.angle * 180 / Math.PI,
+        rotation: s.rotation || 0,
     }));
     try {
         const resp = await fetch('/export', {

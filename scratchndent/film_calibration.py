@@ -150,36 +150,16 @@ def default_kodak_gold_coeffs() -> np.ndarray:
 
     # --- Linear terms ---
     # Primary: scale channels to equalize sensitivity
-    # R channel needs boost (lower net density range after Dmin)
-    # G channel needs reduction (highest net density range)
-    # B channel slight boost
-    coeffs[0, 0] = 1.30     # R density → R out
-    coeffs[1, 1] = 0.88     # G density → G out
-    coeffs[2, 2] = 1.05     # B density → B out
+    coeffs[0, 0] = 1.20     # R density → R out (boost, lower range after Dmin)
+    coeffs[1, 1] = 0.90     # G density → G out (reduce, highest range)
+    coeffs[2, 2] = 1.02     # B density → B out
 
-    # Cross-channel: compensate dye absorption overlap
-    # Cyan dye (R channel) leaks into G → subtract G contribution from R
-    coeffs[1, 0] = -0.18    # G density → R out (cyan-magenta dye overlap)
-    coeffs[2, 0] = -0.05    # B density → R out
-
-    # Magenta dye (G channel) leaks into R and B
-    coeffs[0, 1] = -0.06    # R density → G out
-    coeffs[2, 1] = -0.08    # B density → G out
-
-    # Yellow dye (B channel) leaks into G
-    coeffs[0, 2] = -0.04    # R density → B out
-    coeffs[1, 2] = -0.12    # G density → B out (yellow-magenta overlap)
-
-    # --- Quadratic terms ---
-    # Gentle highlight compression (film response is S-shaped)
-    coeffs[3, 0] = -0.08    # R² → R (compress R highlights)
-    coeffs[4, 1] = -0.06    # G² → G
-    coeffs[5, 2] = -0.05    # B² → B
-
-    # Cross-quadratic: RG interaction for color saturation
-    coeffs[6, 0] = 0.06     # RG → R (boost red saturation in midtones)
-    coeffs[6, 2] = -0.04    # RG → B
-    coeffs[8, 1] = 0.04     # GB → G (boost green separation)
+    # Cross-channel: gentle dye overlap compensation
+    # Keep these mild to avoid shadow color artifacts
+    coeffs[1, 0] = -0.10    # G density → R out
+    coeffs[0, 1] = -0.04    # R density → G out
+    coeffs[2, 1] = -0.04    # B density → G out
+    coeffs[1, 2] = -0.06    # G density → B out
 
     return coeffs
 
@@ -199,24 +179,13 @@ def default_kodak_portra_coeffs() -> np.ndarray:
     coeffs = np.zeros((10, 3), dtype=np.float64)
 
     # Linear — Portra has better channel separation than Gold
-    coeffs[0, 0] = 1.22
-    coeffs[1, 1] = 0.92
+    coeffs[0, 0] = 1.15
+    coeffs[1, 1] = 0.93
     coeffs[2, 2] = 1.00
 
-    # Cross-channel (less correction needed)
-    coeffs[1, 0] = -0.12
-    coeffs[2, 0] = -0.03
-    coeffs[0, 1] = -0.04
-    coeffs[2, 1] = -0.05
-    coeffs[0, 2] = -0.02
-    coeffs[1, 2] = -0.08
-
-    # Gentler quadratic (wider latitude)
-    coeffs[3, 0] = -0.05
-    coeffs[4, 1] = -0.04
-    coeffs[5, 2] = -0.03
-
-    coeffs[6, 0] = 0.04
-    coeffs[8, 1] = 0.03
+    # Gentle cross-channel
+    coeffs[1, 0] = -0.08
+    coeffs[0, 1] = -0.03
+    coeffs[1, 2] = -0.04
 
     return coeffs
