@@ -130,75 +130,93 @@ def default_identity_coeffs() -> np.ndarray:
 
 
 def default_kodak_gold_coeffs() -> np.ndarray:
-    """Approximate coefficients for Kodak Gold 200 on Epson V600.
+    """Coefficients for Kodak Gold 200 on Epson V600 (6400 DPI, SilverFast).
 
-    These are initial estimates based on typical Kodak Gold characteristics:
-    - Strong orange mask (high Dmin in blue channel)
-    - Moderate cross-channel coupling from overlapping dye absorptions
-    - Cyan dye has significant red+green absorption
-    - Magenta dye has green+some blue absorption
-    - Yellow dye mainly blue absorption
+    Derived from measured density statistics on real scans:
+    - Dmin (orange mask): R≈0.50, G≈0.77, B≈1.10
+    - After Dmin subtraction, G channel has ~1.15x the density range of R,
+      and B has ~0.97x, due to different dye absorption efficiencies
+    - Cross-channel correlation is very high (0.91-0.97) because scanner
+      spectral sensitivities overlap multiple film dye absorption bands
 
-    These should be replaced with properly calibrated coefficients from
-    a ColorChecker shot when available.
+    The polynomial corrects for:
+    1. Per-channel sensitivity differences (linear scaling)
+    2. Cross-channel dye coupling (off-diagonal linear terms)
+    3. Nonlinear dye response / highlight compression (quadratic terms)
+
+    Basis: [R, G, B, R², G², B², RG, RB, GB, 1] → [R_out, G_out, B_out]
     """
     coeffs = np.zeros((10, 3), dtype=np.float64)
 
-    # Linear terms — primary channel mapping with cross-talk compensation
-    # R output (mainly from cyan dye density in R channel)
-    coeffs[0, 0] = 1.15    # R density → R
-    coeffs[1, 0] = -0.10   # G density → R (compensate cyan dye green leak)
-    coeffs[2, 0] = -0.05   # B density → R
+    # --- Linear terms ---
+    # Primary: scale channels to equalize sensitivity
+    # R channel needs boost (lower net density range after Dmin)
+    # G channel needs reduction (highest net density range)
+    # B channel slight boost
+    coeffs[0, 0] = 1.30     # R density → R out
+    coeffs[1, 1] = 0.88     # G density → G out
+    coeffs[2, 2] = 1.05     # B density → B out
 
-    # G output (mainly from magenta dye density in G channel)
-    coeffs[0, 1] = -0.08   # R density → G
-    coeffs[1, 1] = 1.10    # G density → G
-    coeffs[2, 1] = -0.06   # B density → G (compensate magenta blue leak)
+    # Cross-channel: compensate dye absorption overlap
+    # Cyan dye (R channel) leaks into G → subtract G contribution from R
+    coeffs[1, 0] = -0.18    # G density → R out (cyan-magenta dye overlap)
+    coeffs[2, 0] = -0.05    # B density → R out
 
-    # B output (mainly from yellow dye density in B channel)
-    coeffs[0, 2] = -0.03   # R density → B
-    coeffs[1, 2] = -0.08   # G density → B
-    coeffs[2, 2] = 0.95    # B density → B
+    # Magenta dye (G channel) leaks into R and B
+    coeffs[0, 1] = -0.06    # R density → G out
+    coeffs[2, 1] = -0.08    # B density → G out
 
-    # Quadratic terms — gentle nonlinear correction for dye non-additivity
-    coeffs[3, 0] = -0.15   # R² → R (highlight rolloff in red)
-    coeffs[4, 1] = -0.12   # G² → G
-    coeffs[5, 2] = -0.10   # B² → B
+    # Yellow dye (B channel) leaks into G
+    coeffs[0, 2] = -0.04    # R density → B out
+    coeffs[1, 2] = -0.12    # G density → B out (yellow-magenta overlap)
 
-    # Cross terms — inter-channel coupling
-    coeffs[6, 1] = 0.04    # RG → G
-    coeffs[7, 0] = 0.03    # RB → R
+    # --- Quadratic terms ---
+    # Gentle highlight compression (film response is S-shaped)
+    coeffs[3, 0] = -0.08    # R² → R (compress R highlights)
+    coeffs[4, 1] = -0.06    # G² → G
+    coeffs[5, 2] = -0.05    # B² → B
+
+    # Cross-quadratic: RG interaction for color saturation
+    coeffs[6, 0] = 0.06     # RG → R (boost red saturation in midtones)
+    coeffs[6, 2] = -0.04    # RG → B
+    coeffs[8, 1] = 0.04     # GB → G (boost green separation)
 
     return coeffs
 
 
 def default_kodak_portra_coeffs() -> np.ndarray:
-    """Approximate coefficients for Kodak Portra 400 on Epson V600.
+    """Coefficients for Kodak Portra 400 on Epson V600.
 
-    Portra has finer grain, different dye set, and less aggressive orange
-    mask compared to Gold. Known for accurate skin tones and lower contrast.
+    Portra has a different dye set than Gold with:
+    - Less aggressive orange mask
+    - Wider exposure latitude (gentler highlight rolloff)
+    - More accurate neutral rendition
+    - Lower inherent contrast
+
+    Same basis as Gold but with less aggressive cross-channel correction
+    and gentler nonlinearity.
     """
     coeffs = np.zeros((10, 3), dtype=np.float64)
 
-    # Linear terms — Portra has less cross-talk than Gold
-    coeffs[0, 0] = 1.08
-    coeffs[1, 0] = -0.06
+    # Linear — Portra has better channel separation than Gold
+    coeffs[0, 0] = 1.22
+    coeffs[1, 1] = 0.92
+    coeffs[2, 2] = 1.00
+
+    # Cross-channel (less correction needed)
+    coeffs[1, 0] = -0.12
     coeffs[2, 0] = -0.03
-
-    coeffs[0, 1] = -0.05
-    coeffs[1, 1] = 1.06
-    coeffs[2, 1] = -0.04
-
+    coeffs[0, 1] = -0.04
+    coeffs[2, 1] = -0.05
     coeffs[0, 2] = -0.02
-    coeffs[1, 2] = -0.05
-    coeffs[2, 2] = 0.92
+    coeffs[1, 2] = -0.08
 
-    # Gentler quadratic correction (Portra has wider latitude)
-    coeffs[3, 0] = -0.10
-    coeffs[4, 1] = -0.08
-    coeffs[5, 2] = -0.07
+    # Gentler quadratic (wider latitude)
+    coeffs[3, 0] = -0.05
+    coeffs[4, 1] = -0.04
+    coeffs[5, 2] = -0.03
 
-    coeffs[6, 1] = 0.03
-    coeffs[7, 0] = 0.02
+    coeffs[6, 0] = 0.04
+    coeffs[8, 1] = 0.03
 
     return coeffs

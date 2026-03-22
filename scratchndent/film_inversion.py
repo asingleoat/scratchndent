@@ -26,8 +26,8 @@ from scratchndent.film_calibration import (
 
 
 STOCK_DEFAULTS = {
-    "kodak_gold": default_identity_coeffs,
-    "kodak_portra": default_identity_coeffs,
+    "kodak_gold": default_kodak_gold_coeffs,
+    "kodak_portra": default_kodak_portra_coeffs,
 }
 
 

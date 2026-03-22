@@ -86,47 +86,23 @@ def apply_srgb_gamma(linear: np.ndarray) -> np.ndarray:
     return out.reshape(h, w, c)
 
 
-def normalize_exposure(
-    scene_linear: np.ndarray,
-    target_mid: float = 0.18,
-    percentile: float = 50.0,
-) -> np.ndarray:
-    """Normalize scene-linear so the median maps to target_mid.
-
-    This is a simple auto-exposure that ensures the tone mapper
-    gets values in its expected range.
-    """
-    luminance = 0.2126 * scene_linear[:, :, 0] + \
-                0.7152 * scene_linear[:, :, 1] + \
-                0.0722 * scene_linear[:, :, 2]
-    current_mid = np.percentile(luminance[luminance > 0], percentile)
-
-    if current_mid > 0:
-        scale = target_mid / current_mid
-        print(f"    Auto-exposure scale: {scale:.3f}")
-        return scene_linear * scale
-
-    return scene_linear
-
 
 def render_to_display(
     scene_linear: np.ndarray,
     *,
-    auto_exposure: bool = True,
-    mid_grey: float = 0.18,
-    contrast: float = 1.2,
+    contrast: float = 1.6,
     black_point: float = 0.0,
 ) -> np.ndarray:
     """Full display rendering pipeline: scene-linear → sRGB uint16.
 
+    The sigmoid tone mapper's midpoint is set to the image's median
+    luminance so the S-curve is centered on the actual content,
+    spreading tones evenly across the display range.
+
     Parameters
     ----------
     scene_linear : HxWx3 float64
-        Scene-linear RGB from film inversion.
-    auto_exposure : bool
-        If True, normalize exposure so median luminance = mid_grey.
-    mid_grey : float
-        Target for middle grey in the tone map.
+        Scene-linear RGB from film inversion (net density values).
     contrast : float
         Sigmoid contrast. 1.0 = flat, 1.5 = punchy, 2.0 = high contrast.
     black_point : float
@@ -139,18 +115,30 @@ def render_to_display(
     """
     img = scene_linear.copy()
 
-    if auto_exposure:
-        print("  Auto-exposure normalization...")
-        img = normalize_exposure(img, target_mid=mid_grey)
+    # Map the actual data range to [0, 1] using robust percentiles,
+    # then apply a gamma curve for contrast. This is content-independent —
+    # it uses the full display range regardless of scene content.
+    luminance = 0.2126 * img[:, :, 0] + 0.7152 * img[:, :, 1] + 0.0722 * img[:, :, 2]
+    pos = luminance[luminance > 0.001]
+    if len(pos) > 0:
+        lo = float(np.percentile(pos, 0.5))
+        hi = float(np.percentile(pos, 99.5))
+    else:
+        lo, hi = 0.0, 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+    print(f"  Data range: {lo:.4f} - {hi:.4f}")
 
-    print(f"  Tone mapping (contrast={contrast:.2f})...")
-    display = sigmoid_tonemap(
-        img,
-        mid_grey=mid_grey,
-        white_point=1.0,
-        black_point=black_point,
-        contrast=contrast,
-    )
+    # Normalize to [0, 1] per-channel using the luminance-derived range
+    display = (img - lo) / (hi - lo)
+    display = np.clip(display, 0.0, 1.0)
+
+    # Apply contrast curve: gamma < 1 pushes midtones darker (more contrast),
+    # gamma > 1 lifts shadows. The 'contrast' parameter maps to gamma as
+    # 1/contrast so that higher contrast = darker midtones = more punch.
+    gamma = 1.0 / contrast
+    print(f"  Applying contrast curve (gamma={gamma:.3f})...")
+    display = np.power(display, gamma)
 
     print("  Applying sRGB gamma...")
     display = apply_srgb_gamma(display)

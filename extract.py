@@ -37,6 +37,26 @@ from scratchndent.film_inversion import compute_dmin, invert_negative
 from scratchndent.film_render import render_to_display
 
 
+CONFIG_FILE = Path("scratchndent_config.json")
+
+
+def load_config() -> dict:
+    """Load persisted settings from config file."""
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_config(updates: dict) -> None:
+    """Merge updates into the config file."""
+    cfg = load_config()
+    cfg.update(updates)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # Globals set at startup
 # ---------------------------------------------------------------------------
@@ -54,7 +74,7 @@ IMAGE_LIST: list[str] = []               # all image paths in folder
 IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
 FILM_STOCK: str | None = None              # film stock for inversion (None = no inversion)
 FILM_PROFILE: str | None = None            # path to calibration profile (overrides stock)
-FILM_CONTRAST: float = 1.2                 # rendering contrast
+FILM_CONTRAST: float = 1.6                 # rendering contrast
 IR_CLEAN: bool = True                     # auto-detect by default
 PREVIEW_SIZE: int = 2400
 LOADING: bool = False                     # True while switching images
@@ -68,6 +88,14 @@ def set_progress(msg: str) -> None:
     global PROGRESS
     PROGRESS = msg
     print(f"  [{msg}]")
+
+
+def _rebate_in_bounds(shape: tuple, rect: dict) -> bool:
+    """Check if rebate rect fits within an image."""
+    h, w = shape[:2]
+    r = rect
+    return (r["x"] >= 0 and r["y"] >= 0 and
+            r["x"] + r["w"] <= w and r["y"] + r["h"] <= h)
 
 
 def make_rebate_mask(h: int, w: int) -> np.ndarray | None:
@@ -122,13 +150,17 @@ def ensure_loaded() -> None:
     # so we skip the cost entirely if the user unchecks IR clean.
     FULL_IR = ir  # None if no IR page
 
-    # Compute Dmin from full strip (rebate gives best estimate)
-    if FILM_STOCK:
-        set_progress("Computing Dmin from full strip...")
-        rebate_mask = make_rebate_mask(h, w)
-        DMIN = compute_dmin(rgb, rebate_mask=rebate_mask)
-    else:
-        DMIN = None
+    # Compute Dmin if we don't already have one from a previous image.
+    # Dmin persists across the roll — set once from a good rebate area.
+    if FILM_STOCK and DMIN is None:
+        if REBATE_RECT and _rebate_in_bounds(rgb.shape, REBATE_RECT):
+            r = REBATE_RECT
+            set_progress("Computing Dmin from rebate selection...")
+            rebate_rgb = rgb[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+            DMIN = compute_dmin(rebate_rgb)
+        else:
+            set_progress("Computing Dmin from full image (no rebate set)...")
+            DMIN = compute_dmin(rgb)
 
     FULL_IMG = rgb
     FULL_IMG_READY = True
@@ -150,13 +182,13 @@ def ir_clean_region(
 def switch_to_image(idx: int) -> None:
     """Load image, generate preview at reduced resolution for speed."""
     global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
-    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, REBATE_RECT
+    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR
     LOADING = True
     FULL_IMG = None
     FULL_IR = None
     FULL_IMG_READY = False
-    DMIN = None
     REBATE_RECT = None
+    # DMIN persists across image switches — same roll = same film base
     IMAGE_IDX = idx
     INPUT_PATH = IMAGE_LIST[idx]
 
@@ -293,11 +325,15 @@ class Handler(BaseHTTPRequestHandler):
                 "image_idx": IMAGE_IDX,
                 "image_count": len(IMAGE_LIST),
                 "loading": LOADING,
+                "has_dmin": DMIN is not None,
             }
             self._respond(200, "application/json", json.dumps(info).encode())
         elif parsed.path == "/progress":
             self._respond(200, "application/json",
                           json.dumps({"status": PROGRESS}).encode())
+        elif parsed.path == "/settings":
+            cfg = load_config()
+            self._respond(200, "application/json", json.dumps(cfg).encode())
         elif parsed.path == "/images":
             data = {
                 "images": [Path(p).name for p in IMAGE_LIST],
@@ -341,13 +377,20 @@ class Handler(BaseHTTPRequestHandler):
                 "h": int(body["h"]),
             }
             print(f"  Rebate set: {REBATE_RECT}")
-            # Recompute Dmin from full strip with new rebate
+            # Compute Dmin from the rebate region and persist
             if FULL_IMG is not None and FILM_STOCK:
                 global DMIN
-                h, w = FULL_IMG.shape[:2]
-                rebate_mask = make_rebate_mask(h, w)
-                DMIN = compute_dmin(FULL_IMG, rebate_mask=rebate_mask)
+                r = REBATE_RECT
+                rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+                DMIN = compute_dmin(rebate_rgb)
                 print(f"  Dmin updated: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
+                save_config({"dmin": DMIN.tolist()})
+            self._respond(200, "application/json",
+                          json.dumps({"ok": True}).encode())
+        elif self.path == "/settings":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            save_config(body)
             self._respond(200, "application/json",
                           json.dumps({"ok": True}).encode())
         else:
@@ -374,6 +417,10 @@ def handle_export(body: dict) -> dict:
 
     set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
     ensure_loaded()
+    if DMIN is not None:
+        print(f"  Dmin: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
+    if REBATE_RECT:
+        print(f"  Rebate: {REBATE_RECT}")
 
     # Align IR once if IR cleaning is requested and we have an IR channel
     aligned_ir = None
@@ -407,7 +454,22 @@ def handle_export(body: dict) -> dict:
             out_path = OUTPUT_DIR / out_name
             n += 1
         set_progress(f"Writing {out_name} ({cropped.shape[1]}x{cropped.shape[0]})...")
-        tifffile.imwrite(str(out_path), cropped)
+        # Embed processing metadata in TIFF Software tag (single-valued,
+        # avoids duplicate ImageDescription that breaks Apple Preview)
+        meta = {
+            "source": Path(INPUT_PATH).name,
+            "stock": FILM_STOCK,
+            "contrast": FILM_CONTRAST,
+            "ir_clean": ir_clean and aligned_ir is not None,
+            "dmin": DMIN.tolist() if DMIN is not None else None,
+            "rebate_rect": REBATE_RECT,
+            "crop": {"cx": cx, "cy": cy, "w": w, "h": h, "angle": angle},
+        }
+        meta_json = json.dumps(meta)
+        tifffile.imwrite(str(out_path), cropped, extratags=[
+            # Tag 65000: private tag for scratchndent metadata
+            (65000, 's', 0, meta_json, True),
+        ])
         exported.append(out_name)
 
     msg = f"Exported {len(exported)} frame{'s' if len(exported) != 1 else ''} to {OUTPUT_DIR}/"
@@ -433,7 +495,7 @@ def find_images(path: Path) -> list[str]:
 
 def main():
     global OUTPUT_DIR, IMAGE_LIST, FILM_STOCK, FILM_PROFILE, FILM_CONTRAST
-    global IR_CLEAN, PREVIEW_SIZE
+    global IR_CLEAN, PREVIEW_SIZE, DMIN
 
     parser = argparse.ArgumentParser(
         description="Browser-based frame extraction from scanned film strips",
@@ -457,8 +519,8 @@ def main():
         help="Path to calibration profile JSON (overrides --stock)",
     )
     parser.add_argument(
-        "--contrast", type=float, default=1.2,
-        help="Rendering contrast (default: 1.2, range ~0.8-2.0)",
+        "--contrast", type=float, default=1.6,
+        help="Rendering contrast (default: 1.6, range ~0.8-2.0)",
     )
     parser.add_argument(
         "--no-ir-clean", action="store_true",
@@ -470,7 +532,13 @@ def main():
     FILM_STOCK = args.stock
     FILM_PROFILE = args.profile
     FILM_CONTRAST = args.contrast
-    IR_CLEAN = not args.no_ir_clean
+
+    # Load persisted settings from config file
+    cfg = load_config()
+    if cfg.get("dmin") and FILM_STOCK:
+        DMIN = np.array(cfg["dmin"], dtype=np.float64)
+        print(f"Loaded Dmin from config: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
+    IR_CLEAN = cfg.get("ir_clean", not args.no_ir_clean)
     PREVIEW_SIZE = args.preview_size
 
     input_path = Path(args.input)

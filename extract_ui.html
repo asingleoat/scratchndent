@@ -65,6 +65,8 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label><input type="checkbox" id="chk-ir" checked> IR clean</label>
+    <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
+    <span id="dmin-display" style="font-size:11px;color:#888"></span>
     <span style="flex:1"></span>
     <label>Base name:</label>
     <input id="basename" value="" style="width:100px">
@@ -133,6 +135,27 @@ imgSelect.addEventListener('change', () => {
     if (idx !== imageIdx) switchImage(idx);
 });
 
+// Load persisted settings
+const dminEl = document.getElementById('dmin-display');
+function updateDminDisplay(dmin) {
+    if (dmin) {
+        dminEl.textContent = `Dmin: ${dmin[0].toFixed(3)} ${dmin[1].toFixed(3)} ${dmin[2].toFixed(3)}`;
+        dminEl.style.color = '#aaa';
+    } else {
+        dminEl.textContent = 'Dmin: not set';
+        dminEl.style.color = '#666';
+    }
+}
+fetch('/settings').then(r => r.json()).then(cfg => {
+    if (cfg.aspect) {
+        document.getElementById('aspect').value = cfg.aspect;
+    }
+    if (cfg.ir_clean !== undefined) {
+        document.getElementById('chk-ir').checked = cfg.ir_clean;
+    }
+    updateDminDisplay(cfg.dmin || null);
+});
+
 function updateImageInfo(info) {
     previewScale = info.preview_scale;
     imageIdx = info.image_idx;
@@ -186,6 +209,21 @@ function screenToImg(sx, sy) {
 }
 
 // --- Aspect ratio ---
+document.getElementById('aspect').addEventListener('change', (e) => {
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ aspect: e.target.value }),
+    });
+});
+document.getElementById('chk-ir').addEventListener('change', (e) => {
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ir_clean: e.target.checked }),
+    });
+});
+
 function getAspect() {
     const v = document.getElementById('aspect').value;
     if (v === 'free') return null;
@@ -495,6 +533,9 @@ canvas.addEventListener('mouseup', () => {
                     w: rebateRect.w / previewScale,
                     h: rebateRect.h / previewScale,
                 }),
+            }).then(() => {
+                // Refresh Dmin display
+                fetch('/settings').then(r => r.json()).then(cfg => updateDminDisplay(cfg.dmin || null));
             });
         } else {
             rebateRect = null;
