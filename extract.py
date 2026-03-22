@@ -32,15 +32,9 @@ from scratchndent import (
     align_ir,
     make_defect_mask,
     inpaint,
-    extract_negadoctor_from_xmp,
-    negadoctor,
-    extract_channelmixer_from_xmp,
-    apply_color_matrix,
-    extract_sigmoid_from_xmp,
-    apply_sigmoid,
-    linear_to_srgb,
-    M_REC2020_D50_TO_SRGB,
 )
+from scratchndent.film_inversion import compute_dmin, invert_negative
+from scratchndent.film_render import render_to_display
 
 
 # ---------------------------------------------------------------------------
@@ -48,20 +42,25 @@ from scratchndent import (
 # ---------------------------------------------------------------------------
 INPUT_PATH: str = ""
 OUTPUT_DIR: Path = Path(".")
-FULL_IMG: np.ndarray | None = None       # full-res processed image (lazy, None until export)
-FULL_IMG_READY: bool = False              # True once full-res processing is done
+FULL_IMG: np.ndarray | None = None       # full-res raw RGB (lazy, None until export)
+FULL_IR: np.ndarray | None = None        # full-res aligned IR (None if no IR)
+FULL_IMG_READY: bool = False              # True once full-res load + alignment is done
+DMIN: np.ndarray | None = None            # per-channel Dmin from full strip
 PREVIEW_JPEG: bytes = b""                # downscaled JPEG for the browser
 PREVIEW_SCALE: float = 1.0               # preview pixels / full pixels
 FULL_WIDTH: int = 0                       # full-res dimensions (from raw load)
 FULL_HEIGHT: int = 0
 IMAGE_LIST: list[str] = []               # all image paths in folder
 IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
-INVERT_XMP: str | None = None
+FILM_STOCK: str | None = None              # film stock for inversion (None = no inversion)
+FILM_PROFILE: str | None = None            # path to calibration profile (overrides stock)
+FILM_CONTRAST: float = 1.2                 # rendering contrast
 IR_CLEAN: bool = True                     # auto-detect by default
 PREVIEW_SIZE: int = 2400
 LOADING: bool = False                     # True while switching images
 HAS_IR: bool = False                      # whether current image has IR channel
 PROGRESS: str = ""                        # current export/processing status for GUI
+REBATE_RECT: dict | None = None           # {x, y, w, h} in full-res coords
 
 
 def set_progress(msg: str) -> None:
@@ -71,41 +70,48 @@ def set_progress(msg: str) -> None:
     print(f"  [{msg}]")
 
 
+def make_rebate_mask(h: int, w: int) -> np.ndarray | None:
+    """Build a boolean mask from the rebate rectangle, if set."""
+    if REBATE_RECT is None:
+        return None
+    r = REBATE_RECT
+    mask = np.zeros((h, w), dtype=bool)
+    y0 = max(0, r["y"])
+    y1 = min(h, r["y"] + r["h"])
+    x0 = max(0, r["x"])
+    x1 = min(w, r["x"] + r["w"])
+    if y1 > y0 and x1 > x0:
+        mask[y0:y1, x0:x1] = True
+    return mask
+
+
 def apply_inversion(img: np.ndarray) -> np.ndarray:
-    """Apply negadoctor + CAT16 + sigmoid pipeline. Input: uint16, output: uint16."""
-    nd_params = extract_negadoctor_from_xmp(INVERT_XMP)
-    result_f = negadoctor(img, nd_params)
-
-    cat_matrix = extract_channelmixer_from_xmp(INVERT_XMP)
-    if cat_matrix is not None:
-        result_f = apply_color_matrix(result_f, cat_matrix)
-
-    sig_params = extract_sigmoid_from_xmp(INVERT_XMP)
-    if sig_params is not None:
-        result_f = apply_sigmoid(result_f, sig_params)
-
-    result_f = apply_color_matrix(result_f, M_REC2020_D50_TO_SRGB)
-    result_f = linear_to_srgb(np.clip(result_f, 0, None))
-    return np.clip(result_f * 65535.0, 0, 65535).astype(np.uint16)
+    """Film inversion pipeline. Input: uint16, output: uint16."""
+    scene_linear = invert_negative(
+        img,
+        dmin=DMIN,
+        stock=FILM_STOCK or "kodak_gold",
+        profile_path=FILM_PROFILE,
+    )
+    return render_to_display(
+        scene_linear,
+        contrast=FILM_CONTRAST,
+    )
 
 
-def apply_ir_clean(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
-    """Run IR-based dust/scratch removal. Returns cleaned rgb."""
-    ir_aligned = align_ir(rgb, ir)
-    mask = make_defect_mask(ir_aligned)
-    if np.count_nonzero(mask) > 0:
-        return inpaint(rgb, mask)
-    return rgb
+def ensure_loaded() -> None:
+    """Load the full-res image and align IR (if present).
 
+    Alignment uses the full strip for best feature matching. Defect
+    detection and inpainting are deferred to per-crop at export time
+    so we only process the regions the user actually selected.
 
-def ensure_ir_cleaned() -> np.ndarray:
-    """Load and IR-clean the current image at full resolution (no inversion).
-
-    Inversion is deferred to per-crop at export time for speed.
+    Dmin is computed from the full strip (using rebate if available)
+    so per-crop inversion has a correct film base reference.
     """
-    global FULL_IMG, FULL_IMG_READY
+    global FULL_IMG, FULL_IR, FULL_IMG_READY, DMIN
     if FULL_IMG_READY:
-        return FULL_IMG
+        return
 
     set_progress("Loading full-resolution image...")
     rgb, ir = load_image(INPUT_PATH)
@@ -113,30 +119,47 @@ def ensure_ir_cleaned() -> np.ndarray:
     set_progress(f"Loaded {w}x{h} image")
 
     if IR_CLEAN and ir is not None:
-        set_progress("Aligning IR channel...")
-        ir_aligned = align_ir(rgb, ir)
-        set_progress("Detecting defects...")
-        mask = make_defect_mask(ir_aligned)
-        n_defects = np.count_nonzero(mask)
-        if n_defects > 0:
-            set_progress(f"Inpainting {n_defects} defect pixels...")
-            rgb = inpaint(rgb, mask)
-        else:
-            set_progress("No defects found")
+        set_progress("Aligning IR channel (full strip)...")
+        FULL_IR = align_ir(rgb, ir)
+        set_progress("IR aligned — defect cleaning deferred to export")
+    else:
+        FULL_IR = None
+
+    # Compute Dmin from full strip (rebate gives best estimate)
+    if FILM_STOCK:
+        set_progress("Computing Dmin from full strip...")
+        rebate_mask = make_rebate_mask(h, w)
+        DMIN = compute_dmin(rgb, rebate_mask=rebate_mask)
+    else:
+        DMIN = None
 
     FULL_IMG = rgb
     FULL_IMG_READY = True
-    set_progress("IR cleaning complete")
-    return FULL_IMG
+
+
+def ir_clean_region(
+    rgb_region: np.ndarray,
+    ir_region: np.ndarray,
+) -> np.ndarray:
+    """Detect and inpaint defects in a cropped region."""
+    mask = make_defect_mask(ir_region, rgb=rgb_region)
+    n_defects = np.count_nonzero(mask)
+    if n_defects > 0:
+        print(f"    {n_defects} defect pixels in region")
+        return inpaint(rgb_region, mask)
+    return rgb_region
 
 
 def switch_to_image(idx: int) -> None:
     """Load image, generate preview at reduced resolution for speed."""
     global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
-    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR
+    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, REBATE_RECT
     LOADING = True
     FULL_IMG = None
+    FULL_IR = None
     FULL_IMG_READY = False
+    DMIN = None
+    REBATE_RECT = None
     IMAGE_IDX = idx
     INPUT_PATH = IMAGE_LIST[idx]
 
@@ -166,7 +189,12 @@ def switch_to_image(idx: int) -> None:
     # handles it properly. This keeps small_rgb in uint16 for accurate inversion.
 
     # Inversion at preview resolution (uint16 preserved for tonal accuracy)
-    if INVERT_XMP:
+    # Compute Dmin from the full-res image for accurate preview, using rebate if set
+    if FILM_STOCK:
+        print("  Computing Dmin for preview...")
+        rebate_mask = make_rebate_mask(h, w)
+        preview_dmin = compute_dmin(rgb, rebate_mask=rebate_mask)
+        DMIN = preview_dmin  # cache for later use
         print("  Inverting (preview)...")
         small_rgb = apply_inversion(small_rgb)
 
@@ -322,6 +350,26 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._respond(400, "application/json",
                               json.dumps({"error": "Invalid index"}).encode())
+        elif self.path == "/rebate":
+            global REBATE_RECT
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            REBATE_RECT = {
+                "x": int(body["x"]),
+                "y": int(body["y"]),
+                "w": int(body["w"]),
+                "h": int(body["h"]),
+            }
+            print(f"  Rebate set: {REBATE_RECT}")
+            # Recompute Dmin from full strip with new rebate
+            if FULL_IMG is not None and FILM_STOCK:
+                global DMIN
+                h, w = FULL_IMG.shape[:2]
+                rebate_mask = make_rebate_mask(h, w)
+                DMIN = compute_dmin(FULL_IMG, rebate_mask=rebate_mask)
+                print(f"  Dmin updated: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
+            self._respond(200, "application/json",
+                          json.dumps({"ok": True}).encode())
         else:
             self._respond(404, "text/plain", b"Not found")
 
@@ -344,16 +392,22 @@ def handle_export(body: dict) -> dict:
     exported = []
 
     set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
-    cleaned = ensure_ir_cleaned()
+    ensure_loaded()
 
     for i, r in enumerate(rects):
         set_progress(f"Cropping frame {i + 1}/{n_rects}...")
         cx, cy, w, h = r["cx"], r["cy"], r["w"], r["h"]
         angle = r.get("angle", 0)
 
-        cropped = crop_rotated_rect(cleaned, cx, cy, w, h, angle)
+        cropped = crop_rotated_rect(FULL_IMG, cx, cy, w, h, angle)
 
-        if INVERT_XMP:
+        # Per-crop IR cleaning (detect + inpaint only the frame region)
+        if FULL_IR is not None:
+            set_progress(f"IR cleaning frame {i + 1}/{n_rects}...")
+            ir_cropped = crop_rotated_rect(FULL_IR, cx, cy, w, h, angle)
+            cropped = ir_clean_region(cropped, ir_cropped)
+
+        if FILM_STOCK:
             set_progress(f"Inverting frame {i + 1}/{n_rects}...")
             cropped = apply_inversion(cropped)
 
@@ -391,7 +445,8 @@ def find_images(path: Path) -> list[str]:
 
 
 def main():
-    global OUTPUT_DIR, IMAGE_LIST, INVERT_XMP, IR_CLEAN, PREVIEW_SIZE
+    global OUTPUT_DIR, IMAGE_LIST, FILM_STOCK, FILM_PROFILE, FILM_CONTRAST
+    global IR_CLEAN, PREVIEW_SIZE
 
     parser = argparse.ArgumentParser(
         description="Browser-based frame extraction from scanned film strips",
@@ -407,8 +462,16 @@ def main():
         help="Max dimension of browser preview in pixels (default: 2400)",
     )
     parser.add_argument(
-        "--invert-xmp", type=str, default=None,
-        help="darktable XMP sidecar for negative-to-positive conversion",
+        "--stock", type=str, default=None,
+        help="Film stock for inversion (kodak_gold, kodak_portra)",
+    )
+    parser.add_argument(
+        "--profile", type=str, default=None,
+        help="Path to calibration profile JSON (overrides --stock)",
+    )
+    parser.add_argument(
+        "--contrast", type=float, default=1.2,
+        help="Rendering contrast (default: 1.2, range ~0.8-2.0)",
     )
     parser.add_argument(
         "--no-ir-clean", action="store_true",
@@ -417,7 +480,9 @@ def main():
     args = parser.parse_args()
 
     OUTPUT_DIR = Path(args.output_dir)
-    INVERT_XMP = args.invert_xmp
+    FILM_STOCK = args.stock
+    FILM_PROFILE = args.profile
+    FILM_CONTRAST = args.contrast
     IR_CLEAN = not args.no_ir_clean
     PREVIEW_SIZE = args.preview_size
 

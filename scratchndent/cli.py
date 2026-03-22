@@ -45,6 +45,7 @@ def process(
     print("Building defect mask...")
     mask = make_defect_mask(
         ir,
+        rgb=rgb,
         threshold=threshold,
         hair_sensitivity=hair_sensitivity,
         min_area=min_area,

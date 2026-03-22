@@ -95,76 +95,133 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
 
 def make_defect_mask(
     ir: np.ndarray,
-    threshold: float = 0.25,
-    hair_sensitivity: float = 0.10,
-    min_area: int = 3,
-    dilate_radius: int = 4,
-    close_radius: int = 6,
+    rgb: np.ndarray | None = None,
+    threshold: float = 0.30,
+    hair_sensitivity: float = 0.12,
+    min_area: int = 4,
+    dilate_radius: int = 3,
+    close_radius: int = 5,
 ) -> np.ndarray:
-    """Create a binary defect mask from the IR channel.
+    """Create a binary defect mask using IR-vs-RGB comparison.
 
-    Combines two detection strategies:
-    1. Ratio-based: catches dust blobs where IR is significantly darker than
-       the local background. Uses two-pass background estimation so large
-       defects don't corrupt their own background.
-    2. Line-based (Meijering filter): catches thin elongated features like
-       hairs and fine scratches that produce only a subtle IR dip.
+    The key insight: film dyes are transparent to infrared, but physical
+    defects (dust, hairs, scratches) block IR light. So a defect is dark
+    in IR but NOT correspondingly dark in RGB. This makes detection robust
+    to exposure level — heavily or lightly exposed frames don't affect the
+    IR-RGB relationship for clean film.
+
+    Combines two strategies:
+    1. IR-RGB discrepancy: flags pixels where IR is darker than expected
+       given the local RGB brightness. Exposure-independent.
+    2. Line-based (Meijering filter): catches thin linear features (hairs)
+       that show up in the IR-RGB discrepancy map.
+
+    Falls back to IR-only detection if rgb is not provided.
 
     Returns a uint8 mask where 255 = defect, 0 = clean.
     """
     ir_f = ir.astype(np.float32) / 65535.0
 
-    # --- Ratio-based detection (dust, large scratches) ---
+    if rgb is not None:
+        # --- IR-vs-RGB discrepancy detection ---
+        # Convert RGB to luminance for comparison
+        rgb_f = rgb.astype(np.float32) / 65535.0
+        rgb_lum = 0.2126 * rgb_f[:, :, 0] + 0.7152 * rgb_f[:, :, 1] + 0.0722 * rgb_f[:, :, 2]
 
-    blur_size = 301
-    background = cv2.GaussianBlur(ir_f, (blur_size, blur_size), 0)
+        # Smooth both channels to reduce noise before comparison
+        blur_size = 15
+        ir_smooth = cv2.GaussianBlur(ir_f, (blur_size, blur_size), 0)
+        rgb_smooth = cv2.GaussianBlur(rgb_lum, (blur_size, blur_size), 0)
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ratio = np.where(background > 0.01, ir_f / background, 1.0)
+        # Compute local relationship between IR and RGB using large-scale
+        # statistics. In clean film, IR and RGB correlate locally (both are
+        # affected by film density). Defects break this correlation.
+        local_blur = 301
+        ir_local = cv2.GaussianBlur(ir_f, (local_blur, local_blur), 0)
+        rgb_local = cv2.GaussianBlur(rgb_lum, (local_blur, local_blur), 0)
 
-    coarse_mask = ratio < (1.0 - threshold)
+        # Expected IR given local RGB: scale IR by the local IR/RGB ratio
+        with np.errstate(divide='ignore', invalid='ignore'):
+            local_ratio = np.where(rgb_local > 0.01, ir_local / rgb_local, 1.0)
+        expected_ir = rgb_smooth * local_ratio
 
-    # Second pass: re-estimate background with defects replaced
-    ir_cleaned = ir_f.copy()
-    ir_cleaned[coarse_mask] = background[coarse_mask]
-    background = cv2.GaussianBlur(ir_cleaned, (blur_size, blur_size), 0)
+        # Discrepancy: how much darker is IR than expected from RGB?
+        # Positive values = IR darker than expected = likely defect
+        with np.errstate(divide='ignore', invalid='ignore'):
+            discrepancy = np.where(
+                expected_ir > 0.01,
+                1.0 - ir_smooth / expected_ir,
+                0.0,
+            )
+        discrepancy = np.clip(discrepancy, 0, 1)
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ratio = np.where(background > 0.01, ir_f / background, 1.0)
+        # Two-pass: mask obvious defects, re-estimate, detect again
+        coarse_mask = discrepancy > threshold
 
-    dust_mask = ratio < (1.0 - threshold)
+        ir_cleaned = ir_f.copy()
+        ir_cleaned[coarse_mask] = expected_ir[coarse_mask]
+        ir_local2 = cv2.GaussianBlur(ir_cleaned, (local_blur, local_blur), 0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            local_ratio2 = np.where(rgb_local > 0.01, ir_local2 / rgb_local, 1.0)
+        expected_ir2 = rgb_smooth * local_ratio2
+        with np.errstate(divide='ignore', invalid='ignore'):
+            discrepancy2 = np.where(
+                expected_ir2 > 0.01,
+                1.0 - ir_smooth / expected_ir2,
+                0.0,
+            )
+        discrepancy2 = np.clip(discrepancy2, 0, 1)
+
+        dust_mask = discrepancy2 > threshold
+
+        # --- Line detection on discrepancy map (not raw IR) ---
+        scale = 0.25
+        disc_small = cv2.resize(discrepancy2, None, fx=scale, fy=scale,
+                                interpolation=cv2.INTER_AREA).astype(np.float64)
+    else:
+        # --- Fallback: IR-only detection ---
+        blur_size = 301
+        background = cv2.GaussianBlur(ir_f, (blur_size, blur_size), 0)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(background > 0.01, ir_f / background, 1.0)
+        coarse_mask = ratio < (1.0 - threshold)
+
+        ir_cleaned = ir_f.copy()
+        ir_cleaned[coarse_mask] = background[coarse_mask]
+        background = cv2.GaussianBlur(ir_cleaned, (blur_size, blur_size), 0)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratio = np.where(background > 0.01, ir_f / background, 1.0)
+        dust_mask = ratio < (1.0 - threshold)
+
+        scale = 0.25
+        bg_small = cv2.resize(background, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_AREA)
+        ir_small = cv2.resize(ir_f, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_AREA)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            disc_small = np.where(bg_small > 0.01, 1.0 - ir_small / bg_small, 0.0)
+        disc_small = np.clip(disc_small, 0, 1).astype(np.float64)
+        discrepancy2 = None  # not used for gating in fallback
 
     # --- Line-based detection (hairs, fine scratches) ---
-
-    # Invert so dark defects become bright ridges for the line detector.
-    # Work on a downsampled version for speed — Meijering is expensive.
-    scale = 0.25
-    ir_small = cv2.resize(ir_f, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_AREA)
-    bg_small = cv2.resize(background, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_AREA)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        deviation = np.where(bg_small > 0.01, 1.0 - ir_small / bg_small, 0.0)
-    deviation = np.clip(deviation, 0, 1).astype(np.float64)
-
-    # Meijering filter detects ridge-like (tubular) structures at multiple
-    # scales — sigmas cover thin scratches (1) through thick hairs (8)
-    line_response = meijering(deviation, sigmas=range(1, 9), black_ridges=False)
+    line_response = meijering(disc_small, sigmas=range(1, 9), black_ridges=False)
     line_mask_small = (line_response > hair_sensitivity).astype(np.uint8) * 255
 
-    # Scale back up to full resolution
     line_mask = cv2.resize(line_mask_small, (ir_f.shape[1], ir_f.shape[0]),
                            interpolation=cv2.INTER_NEAREST)
 
-    # Only keep line detections where the IR is actually darker than background
-    # (prevents false positives on film grain / image detail)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        full_ratio = np.where(background > 0.01, ir_f / background, 1.0)
-    line_mask[full_ratio > 0.95] = 0
+    # Gate line detections: only keep where the discrepancy is meaningful
+    if discrepancy2 is not None:
+        line_mask[discrepancy2 < threshold * 0.3] = 0
+    else:
+        # IR-only fallback gate
+        with np.errstate(divide='ignore', invalid='ignore'):
+            full_ratio = np.where(background > 0.01, ir_f / background, 1.0)
+        line_mask[full_ratio > 0.95] = 0
 
     # --- Combine both masks ---
-
     mask = np.where(dust_mask, 255, line_mask).astype(np.uint8)
 
     # Morphological close to fill holes within partially-detected large defects
@@ -191,6 +248,13 @@ def make_defect_mask(
             (2 * dilate_radius + 1, 2 * dilate_radius + 1),
         )
         mask = cv2.dilate(mask, kernel)
+
+    # Sanity check
+    coverage = np.count_nonzero(mask) / mask.size
+    if coverage > 0.03:
+        print(f"WARNING: defect mask covers {100*coverage:.1f}% of image — "
+              f"returning empty mask.", file=sys.stderr)
+        return np.zeros_like(mask)
 
     return mask
 

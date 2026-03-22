@@ -47,7 +47,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
 <body>
 <div id="toolbar">
     <button id="btn-prev" title="Previous image">&larr;</button>
-    <span id="img-name" style="font-size:13px;min-width:120px;text-align:center"></span>
+    <select id="img-select" style="font-size:13px;max-width:220px"></select>
     <button id="btn-next" title="Next image">&rarr;</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label>Aspect:</label>
@@ -61,6 +61,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
         <option value="1:1">1:1</option>
     </select>
     <button id="btn-add">+ New selection</button>
+    <button id="btn-rebate" title="Select an area of unexposed film (the orange strip between frames or at the edge of the strip) to calibrate base color removal">Set rebate</button>
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="flex:1"></span>
     <label>Base name:</label>
@@ -93,9 +94,10 @@ let previewScale = 1; // preview px / full px
 
 let selections = [];
 let activeIdx = -1;
-let mode = 'idle'; // idle, drawing, moving, resizing, rotating
+let mode = 'idle'; // idle, drawing, moving, resizing, rotating, drawing_rebate
 let drawStart = null;
 let dragInfo = null;
+let rebateRect = null; // {x, y, w, h} in preview coords, or null
 
 const HANDLE_SIZE = 8;
 const ROT_HANDLE_DIST = 30;
@@ -108,16 +110,33 @@ img.onload = () => {
 };
 img.src = '/preview';
 let imageIdx = 0, imageCount = 1;
-const imgNameEl = document.getElementById('img-name');
+const imgSelect = document.getElementById('img-select');
 const basenameEl = document.getElementById('basename');
 const overlay = document.getElementById('loading-overlay');
+
+// Populate image dropdown
+fetch('/images').then(r => r.json()).then(data => {
+    imgSelect.innerHTML = '';
+    data.images.forEach((name, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `${i + 1}/${data.images.length}: ${name}`;
+        imgSelect.appendChild(opt);
+    });
+    imgSelect.value = data.current;
+});
+
+imgSelect.addEventListener('change', () => {
+    const idx = parseInt(imgSelect.value);
+    if (idx !== imageIdx) switchImage(idx);
+});
 
 function updateImageInfo(info) {
     previewScale = info.preview_scale;
     imageIdx = info.image_idx;
     imageCount = info.image_count;
     const name = info.filename || '';
-    imgNameEl.textContent = `${imageIdx + 1}/${imageCount}: ${name}`;
+    imgSelect.value = imageIdx;
     basenameEl.value = name.replace(/\.[^.]+$/, '');
     statusEl.textContent = `${name} | ${info.full_width}x${info.full_height} | Preview scale: ${previewScale.toFixed(3)}`;
     document.getElementById('btn-prev').disabled = imageIdx <= 0;
@@ -128,7 +147,7 @@ fetch('/info').then(r => r.json()).then(updateImageInfo);
 
 async function switchImage(idx) {
     overlay.style.display = 'flex';
-    selections = []; activeIdx = -1; updateSelList();
+    selections = []; activeIdx = -1; rebateRect = null; updateSelList();
     const resp = await fetch('/switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -265,6 +284,23 @@ function render() {
     ctx.drawImage(img, 0, 0);
     ctx.restore();
 
+    // Draw rebate region
+    if (rebateRect) {
+        const r = rebateRect;
+        const [rx, ry] = imgToScreen(r.x, r.y);
+        const rw = r.w * scale, rh = r.h * scale;
+        ctx.fillStyle = 'rgba(255, 160, 0, 0.15)';
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeStyle = '#fa0';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#fa0';
+        ctx.font = '11px system-ui';
+        ctx.fillText('rebate (Dmin)', rx + 4, ry + 14);
+    }
+
     // Draw selections
     selections.forEach((s, i) => {
         const isActive = i === activeIdx;
@@ -348,6 +384,9 @@ canvas.addEventListener('mousedown', (e) => {
             dragInfo = { cx, cy, startAngle: Math.atan2(my - cy, mx - cx), origAngle: s.angle };
         }
         updateSelList(); render();
+    } else if (mode === 'rebate_pending') {
+        mode = 'drawing_rebate';
+        drawStart = { x: mx, y: my };
     } else {
         // Start drawing new selection
         mode = 'drawing';
@@ -358,7 +397,16 @@ canvas.addEventListener('mousedown', (e) => {
 canvas.addEventListener('mousemove', (e) => {
     const [mx, my] = screenToImg(e.offsetX, e.offsetY);
 
-    if (mode === 'drawing' && drawStart) {
+    if (mode === 'drawing_rebate' && drawStart) {
+        const w = mx - drawStart.x, h = my - drawStart.y;
+        rebateRect = {
+            x: Math.min(drawStart.x, mx),
+            y: Math.min(drawStart.y, my),
+            w: Math.abs(w),
+            h: Math.abs(h),
+        };
+        render();
+    } else if (mode === 'drawing' && drawStart) {
         let w = mx - drawStart.x, h = my - drawStart.y;
         const aspect = getAspect();
         if (aspect) {
@@ -432,6 +480,28 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 canvas.addEventListener('mouseup', () => {
+    if (mode === 'drawing_rebate') {
+        if (rebateRect && rebateRect.w > 5 && rebateRect.h > 5) {
+            statusEl.textContent = `Rebate set (${Math.round(rebateRect.w)}x${Math.round(rebateRect.h)} px)`;
+            // Send to server
+            fetch('/rebate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    x: rebateRect.x / previewScale,
+                    y: rebateRect.y / previewScale,
+                    w: rebateRect.w / previewScale,
+                    h: rebateRect.h / previewScale,
+                }),
+            });
+        } else {
+            rebateRect = null;
+            statusEl.textContent = 'Rebate selection too small, cleared';
+        }
+        mode = 'idle'; drawStart = null;
+        render();
+        return;
+    }
     if (mode === 'drawing' && activeIdx >= 0 && selections[activeIdx]._temp) {
         const s = selections[activeIdx];
         delete s._temp;
@@ -489,6 +559,12 @@ document.getElementById('btn-add').addEventListener('click', () => {
     const vcy = (canvas.height / 2 - offsetY) / scale;
     addSelection(vcx - w / 2, vcy - h / 2, w, h);
     render();
+});
+
+document.getElementById('btn-rebate').addEventListener('click', () => {
+    mode = 'rebate_pending';
+    statusEl.textContent = 'Click and drag over unexposed film edge (rebate area)';
+    canvas.style.cursor = 'crosshair';
 });
 
 document.getElementById('btn-prev').addEventListener('click', () => {
