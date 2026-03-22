@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Frame Extractor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+#toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 48px; z-index: 100;
+    background: #2a2a2a; display: flex; align-items: center; padding: 0 16px; gap: 12px;
+    border-bottom: 1px solid #444;
+}
+#toolbar label { font-size: 13px; color: #aaa; }
+#toolbar select, #toolbar button, #toolbar input {
+    font-size: 13px; padding: 4px 8px; border-radius: 4px; border: 1px solid #555;
+    background: #333; color: #eee;
+}
+#toolbar button { cursor: pointer; }
+#toolbar button:hover { background: #444; }
+#toolbar button.primary { background: #2d6; color: #111; border-color: #2d6; font-weight: 600; }
+#toolbar button.primary:hover { background: #3e7; }
+#toolbar button.danger { background: #d44; color: #fff; border-color: #d44; }
+#toolbar button.danger:hover { background: #e55; }
+#sidebar {
+    position: fixed; top: 48px; right: 0; width: 240px; bottom: 0;
+    background: #222; border-left: 1px solid #444; overflow-y: auto; padding: 8px;
+    z-index: 90;
+}
+.sel-item {
+    padding: 8px; margin-bottom: 4px; border-radius: 4px; background: #2a2a2a;
+    border: 1px solid #444; font-size: 12px; cursor: pointer;
+}
+.sel-item.active { border-color: #2d6; }
+.sel-item .del { float: right; cursor: pointer; color: #d44; }
+#canvas-wrap {
+    position: fixed; top: 48px; left: 0; right: 240px; bottom: 0; overflow: hidden;
+}
+canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
+#status {
+    position: fixed; bottom: 0; left: 0; right: 240px; height: 24px;
+    background: #2a2a2a; border-top: 1px solid #444; padding: 0 12px;
+    font-size: 12px; line-height: 24px; color: #888; z-index: 100;
+}
+</style>
+</head>
+<body>
+<div id="toolbar">
+    <button id="btn-prev" title="Previous image">&larr;</button>
+    <span id="img-name" style="font-size:13px;min-width:120px;text-align:center"></span>
+    <button id="btn-next" title="Next image">&rarr;</button>
+    <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
+    <label>Aspect:</label>
+    <select id="aspect">
+        <option value="free">Free</option>
+        <option value="3:2" selected>3:2</option>
+        <option value="2:3">2:3</option>
+        <option value="4:3">4:3</option>
+        <option value="3:4">3:4</option>
+        <option value="5:4">5:4</option>
+        <option value="1:1">1:1</option>
+    </select>
+    <button id="btn-add">+ New selection</button>
+    <button id="btn-clear" class="danger">Clear all</button>
+    <span style="flex:1"></span>
+    <label>Base name:</label>
+    <input id="basename" value="" style="width:100px">
+    <button id="btn-export" class="primary">Export all</button>
+</div>
+<div id="loading-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+    background:rgba(0,0,0,0.7);z-index:200;align-items:center;justify-content:center;
+    font-size:20px;color:#eee;">Loading...</div>
+<div id="canvas-wrap">
+    <canvas id="canvas"></canvas>
+</div>
+<div id="sidebar">
+    <div style="padding:4px 0 8px;font-size:13px;color:#888;">Selections</div>
+    <div id="sel-list"></div>
+</div>
+<div id="status">Ready</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const wrap = document.getElementById('canvas-wrap');
+const selList = document.getElementById('sel-list');
+const statusEl = document.getElementById('status');
+
+let img = new window.Image();
+let imgW = 0, imgH = 0;
+let scale = 1, offsetX = 0, offsetY = 0;
+let previewScale = 1; // preview px / full px
+
+let selections = [];
+let activeIdx = -1;
+let mode = 'idle'; // idle, drawing, moving, resizing, rotating
+let drawStart = null;
+let dragInfo = null;
+
+const HANDLE_SIZE = 8;
+const ROT_HANDLE_DIST = 30;
+
+// --- Image loading ---
+img.onload = () => {
+    imgW = img.width; imgH = img.height;
+    fitImage();
+    render();
+};
+img.src = '/preview';
+let imageIdx = 0, imageCount = 1;
+const imgNameEl = document.getElementById('img-name');
+const basenameEl = document.getElementById('basename');
+const overlay = document.getElementById('loading-overlay');
+
+function updateImageInfo(info) {
+    previewScale = info.preview_scale;
+    imageIdx = info.image_idx;
+    imageCount = info.image_count;
+    const name = info.filename || '';
+    imgNameEl.textContent = `${imageIdx + 1}/${imageCount}: ${name}`;
+    basenameEl.value = name.replace(/\.[^.]+$/, '');
+    statusEl.textContent = `${name} | ${info.full_width}x${info.full_height} | Preview scale: ${previewScale.toFixed(3)}`;
+    document.getElementById('btn-prev').disabled = imageIdx <= 0;
+    document.getElementById('btn-next').disabled = imageIdx >= imageCount - 1;
+}
+
+fetch('/info').then(r => r.json()).then(updateImageInfo);
+
+async function switchImage(idx) {
+    overlay.style.display = 'flex';
+    selections = []; activeIdx = -1; updateSelList();
+    const resp = await fetch('/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idx }),
+    });
+    const info = await resp.json();
+    updateImageInfo(info);
+    // Reload preview (cache-bust)
+    img.src = '/preview?' + Date.now();
+    // img.onload will call fitImage + render, then hide overlay
+}
+
+const origOnload = img.onload;
+img.onload = () => {
+    imgW = img.width; imgH = img.height;
+    fitImage();
+    render();
+    overlay.style.display = 'none';
+};
+
+function fitImage() {
+    const ww = wrap.clientWidth, wh = wrap.clientHeight;
+    scale = Math.min(ww / imgW, wh / imgH) * 0.95;
+    offsetX = (ww - imgW * scale) / 2;
+    offsetY = (wh - imgH * scale) / 2;
+}
+
+// --- Coordinate transforms ---
+function imgToScreen(x, y) {
+    return [x * scale + offsetX, y * scale + offsetY];
+}
+function screenToImg(sx, sy) {
+    return [(sx - offsetX) / scale, (sy - offsetY) / scale];
+}
+
+// --- Aspect ratio ---
+function getAspect() {
+    const v = document.getElementById('aspect').value;
+    if (v === 'free') return null;
+    const [a, b] = v.split(':').map(Number);
+    return a / b;
+}
+
+// --- Selection model ---
+let lastAngle = 0, lastW = 0, lastH = 0;
+function addSelection(x, y, w, h, angle = lastAngle) {
+    selections.push({ x, y, w, h, angle });
+    activeIdx = selections.length - 1;
+    updateSelList();
+}
+
+function updateSelList() {
+    selList.innerHTML = '';
+    selections.forEach((s, i) => {
+        const div = document.createElement('div');
+        div.className = 'sel-item' + (i === activeIdx ? ' active' : '');
+        const fw = (s.w / previewScale)|0, fh = (s.h / previewScale)|0;
+        div.innerHTML = `<span class="del" data-i="${i}">&times;</span>#${i + 1}: ${fw}&times;${fh}`;
+        div.addEventListener('click', (e) => {
+            if (e.target.classList.contains('del')) {
+                selections.splice(i, 1);
+                if (activeIdx >= selections.length) activeIdx = selections.length - 1;
+                updateSelList(); render();
+            } else {
+                activeIdx = i; updateSelList(); render();
+            }
+        });
+        selList.appendChild(div);
+    });
+}
+
+// --- Hit testing ---
+function getHandles(s) {
+    const cos = Math.cos(s.angle), sin = Math.sin(s.angle);
+    const hw = s.w / 2, hh = s.h / 2;
+    const cx = s.x + hw, cy = s.y + hh;
+    function rot(lx, ly) {
+        return [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos];
+    }
+    return {
+        tl: rot(-hw, -hh), tr: rot(hw, -hh),
+        bl: rot(-hw, hh), br: rot(hw, hh),
+        tm: rot(0, -hh), bm: rot(0, hh),
+        ml: rot(-hw, 0), mr: rot(hw, 0),
+        rot_t: rot(0, -hh - ROT_HANDLE_DIST / scale),
+        rot_b: rot(0, hh + ROT_HANDLE_DIST / scale),
+        rot_l: rot(-hw - ROT_HANDLE_DIST / scale, 0),
+        rot_r: rot(hw + ROT_HANDLE_DIST / scale, 0),
+        center: [cx, cy],
+    };
+}
+
+function hitTest(mx, my) {
+    const threshold = HANDLE_SIZE / scale;
+    for (let i = selections.length - 1; i >= 0; i--) {
+        const s = selections[i];
+        const h = getHandles(s);
+        // Rotation handles (all 4 sides)
+        for (const rk of ['rot_t', 'rot_b', 'rot_l', 'rot_r']) {
+            const [rx, ry] = h[rk];
+            if (Math.hypot(mx - rx, my - ry) < threshold * 1.5) {
+                return { type: 'rotate', idx: i };
+            }
+        }
+        // Corner/edge handles
+        for (const name of ['tl', 'tr', 'bl', 'br', 'tm', 'bm', 'ml', 'mr']) {
+            const [px, py] = h[name];
+            if (Math.hypot(mx - px, my - py) < threshold) {
+                return { type: 'resize', idx: i, handle: name };
+            }
+        }
+        // Inside test (unrotated space)
+        const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
+        const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+        const dx = mx - cx, dy = my - cy;
+        const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
+        if (Math.abs(lx) < s.w / 2 && Math.abs(ly) < s.h / 2) {
+            return { type: 'move', idx: i };
+        }
+    }
+    return null;
+}
+
+// --- Rendering ---
+function render() {
+    const ww = wrap.clientWidth, wh = wrap.clientHeight;
+    canvas.width = ww; canvas.height = wh;
+    ctx.clearRect(0, 0, ww, wh);
+
+    // Draw image
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    ctx.restore();
+
+    // Draw selections
+    selections.forEach((s, i) => {
+        const isActive = i === activeIdx;
+        const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+        const [scx, scy] = imgToScreen(cx, cy);
+
+        ctx.save();
+        ctx.translate(scx, scy);
+        ctx.rotate(s.angle);
+
+        // Rectangle
+        const sw = s.w * scale, sh = s.h * scale;
+        ctx.strokeStyle = isActive ? '#2d6' : '#fff';
+        ctx.lineWidth = isActive ? 2 : 1;
+        ctx.strokeRect(-sw / 2, -sh / 2, sw, sh);
+
+        // Semi-transparent fill
+        ctx.fillStyle = isActive ? 'rgba(34,221,102,0.08)' : 'rgba(255,255,255,0.05)';
+        ctx.fillRect(-sw / 2, -sh / 2, sw, sh);
+
+        if (isActive) {
+            // Handles
+            ctx.fillStyle = '#2d6';
+            const hs = HANDLE_SIZE;
+            for (const [hx, hy] of [
+                [-sw/2, -sh/2], [sw/2, -sh/2], [-sw/2, sh/2], [sw/2, sh/2],
+                [0, -sh/2], [0, sh/2], [-sw/2, 0], [sw/2, 0],
+            ]) {
+                ctx.fillRect(hx - hs/2, hy - hs/2, hs, hs);
+            }
+            // Rotation handles (all 4 sides)
+            const rotPositions = [
+                [0, -sh/2, 0, -sh/2 - ROT_HANDLE_DIST],
+                [0, sh/2, 0, sh/2 + ROT_HANDLE_DIST],
+                [-sw/2, 0, -sw/2 - ROT_HANDLE_DIST, 0],
+                [sw/2, 0, sw/2 + ROT_HANDLE_DIST, 0],
+            ];
+            for (const [x1, y1, x2, y2] of rotPositions) {
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+                ctx.strokeStyle = '#2d6';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(x2, y2, hs * 0.7, 0, Math.PI * 2);
+                ctx.fillStyle = '#2d6';
+                ctx.fill();
+            }
+
+            // Label
+            ctx.fillStyle = '#2d6';
+            ctx.font = '12px system-ui';
+            ctx.textAlign = 'center';
+            const fw = (s.w / previewScale)|0, fh = (s.h / previewScale)|0;
+            ctx.fillText(`#${i+1}: ${fw}×${fh}`, 0, -sh/2 - ROT_HANDLE_DIST - 14);
+        }
+
+        ctx.restore();
+    });
+}
+
+// --- Mouse handling ---
+canvas.addEventListener('mousedown', (e) => {
+    const [mx, my] = screenToImg(e.offsetX, e.offsetY);
+    const hit = hitTest(mx, my);
+
+    if (hit) {
+        activeIdx = hit.idx;
+        const s = selections[hit.idx];
+        if (hit.type === 'move') {
+            mode = 'moving';
+            dragInfo = { startMx: mx, startMy: my, origX: s.x, origY: s.y };
+        } else if (hit.type === 'resize') {
+            mode = 'resizing';
+            dragInfo = { handle: hit.handle, startMx: mx, startMy: my,
+                         origX: s.x, origY: s.y, origW: s.w, origH: s.h };
+        } else if (hit.type === 'rotate') {
+            mode = 'rotating';
+            const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+            dragInfo = { cx, cy, startAngle: Math.atan2(my - cy, mx - cx), origAngle: s.angle };
+        }
+        updateSelList(); render();
+    } else {
+        // Start drawing new selection
+        mode = 'drawing';
+        drawStart = { x: mx, y: my };
+    }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+    const [mx, my] = screenToImg(e.offsetX, e.offsetY);
+
+    if (mode === 'drawing' && drawStart) {
+        let w = mx - drawStart.x, h = my - drawStart.y;
+        const aspect = getAspect();
+        if (aspect) {
+            const sign = Math.sign(h) || 1;
+            h = sign * Math.abs(w) / aspect;
+        }
+        // Update or create temp selection
+        if (activeIdx >= 0 && selections[activeIdx]._temp) {
+            const s = selections[activeIdx];
+            s.x = w >= 0 ? drawStart.x : drawStart.x + w;
+            s.y = h >= 0 ? drawStart.y : drawStart.y + h;
+            s.w = Math.abs(w); s.h = Math.abs(h);
+        } else {
+            const sx = w >= 0 ? drawStart.x : drawStart.x + w;
+            const sy = h >= 0 ? drawStart.y : drawStart.y + h;
+            addSelection(sx, sy, Math.abs(w), Math.abs(h));
+            selections[activeIdx]._temp = true;
+        }
+        render();
+    } else if (mode === 'moving' && dragInfo) {
+        const s = selections[activeIdx];
+        s.x = dragInfo.origX + (mx - dragInfo.startMx);
+        s.y = dragInfo.origY + (my - dragInfo.startMy);
+        render(); updateSelList();
+    } else if (mode === 'resizing' && dragInfo) {
+        const s = selections[activeIdx];
+        const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
+        const cx = dragInfo.origX + dragInfo.origW / 2;
+        const cy = dragInfo.origY + dragInfo.origH / 2;
+        const dx = mx - dragInfo.startMx, dy = my - dragInfo.startMy;
+        // Rotate delta into local space
+        const ldx = dx * cos - dy * sin;
+        const ldy = dx * sin + dy * cos;
+        const h = dragInfo.handle;
+        let nw = dragInfo.origW, nh = dragInfo.origH;
+        let nox = 0, noy = 0;
+        if (h.includes('r')) { nw += ldx; }
+        if (h.includes('l')) { nw -= ldx; nox = ldx; }
+        if (h.includes('b')) { nh += ldy; }
+        if (h.includes('t')) { nh -= ldy; noy = ldy; }
+        // Enforce aspect ratio
+        const aspect = getAspect();
+        if (aspect) {
+            if (h === 'ml' || h === 'mr') { nh = nw / aspect; }
+            else if (h === 'tm' || h === 'bm') { nw = nh * aspect; }
+            else { nh = nw / aspect; }
+        }
+        nw = Math.max(nw, 20); nh = Math.max(nh, 20);
+        // Adjust position for the offset (rotate back)
+        const rcos = Math.cos(s.angle), rsin = Math.sin(s.angle);
+        s.x = dragInfo.origX + nox * rcos - noy * rsin;
+        s.y = dragInfo.origY + nox * rsin + noy * rcos;
+        s.w = nw; s.h = nh;
+        render(); updateSelList();
+    } else if (mode === 'rotating' && dragInfo) {
+        const s = selections[activeIdx];
+        const angle = Math.atan2(my - dragInfo.cy, mx - dragInfo.cx);
+        s.angle = dragInfo.origAngle + (angle - dragInfo.startAngle);
+        render();
+    } else {
+        // Update cursor
+        const hit = hitTest(mx, my);
+        if (hit) {
+            if (hit.type === 'rotate') canvas.style.cursor = 'grab';
+            else if (hit.type === 'move') canvas.style.cursor = 'move';
+            else canvas.style.cursor = 'nwse-resize';
+        } else {
+            canvas.style.cursor = 'crosshair';
+        }
+    }
+});
+
+canvas.addEventListener('mouseup', () => {
+    if (mode === 'drawing' && activeIdx >= 0 && selections[activeIdx]._temp) {
+        const s = selections[activeIdx];
+        delete s._temp;
+        if (s.w < 10 || s.h < 10) {
+            selections.splice(activeIdx, 1);
+            activeIdx = selections.length - 1;
+        }
+        updateSelList();
+    }
+    if (activeIdx >= 0) {
+        const s = selections[activeIdx];
+        lastAngle = s.angle;
+        lastW = s.w;
+        lastH = s.h;
+    }
+    mode = 'idle'; dragInfo = null; drawStart = null;
+    render();
+});
+
+// --- Zoom/pan with scroll ---
+canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    const mx = e.offsetX, my = e.offsetY;
+    offsetX = mx - (mx - offsetX) * factor;
+    offsetY = my - (my - offsetY) * factor;
+    scale *= factor;
+    render();
+}, { passive: false });
+
+// --- Middle mouse pan ---
+let panning = false, panStart = null;
+canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 1) { panning = true; panStart = { x: e.offsetX - offsetX, y: e.offsetY - offsetY }; e.preventDefault(); }
+});
+canvas.addEventListener('mousemove', (e) => {
+    if (panning && panStart) { offsetX = e.offsetX - panStart.x; offsetY = e.offsetY - panStart.y; render(); }
+});
+canvas.addEventListener('mouseup', (e) => {
+    if (e.button === 1) { panning = false; panStart = null; }
+});
+
+// --- Buttons ---
+document.getElementById('btn-add').addEventListener('click', () => {
+    let w, h;
+    if (lastW > 0 && lastH > 0) {
+        w = lastW; h = lastH;
+    } else {
+        const aspect = getAspect() || 1.5;
+        h = imgH * 0.3;
+        w = h * aspect;
+    }
+    // Place in center of current viewport
+    const vcx = (canvas.width / 2 - offsetX) / scale;
+    const vcy = (canvas.height / 2 - offsetY) / scale;
+    addSelection(vcx - w / 2, vcy - h / 2, w, h);
+    render();
+});
+
+document.getElementById('btn-prev').addEventListener('click', () => {
+    if (imageIdx > 0) switchImage(imageIdx - 1);
+});
+document.getElementById('btn-next').addEventListener('click', () => {
+    if (imageIdx < imageCount - 1) switchImage(imageIdx + 1);
+});
+
+document.getElementById('btn-clear').addEventListener('click', () => {
+    selections = []; activeIdx = -1; updateSelList(); render();
+});
+
+document.getElementById('btn-export').addEventListener('click', async () => {
+    if (selections.length === 0) { statusEl.textContent = 'No selections to export'; return; }
+    const exportBtn = document.getElementById('btn-export');
+    exportBtn.disabled = true;
+    exportBtn.textContent = 'Exporting...';
+    const basename = document.getElementById('basename').value || 'frame';
+    statusEl.textContent = 'Starting export...';
+
+    // Poll progress while export runs
+    const pollId = setInterval(async () => {
+        try {
+            const pr = await fetch('/progress');
+            const pj = await pr.json();
+            if (pj.status) statusEl.textContent = pj.status;
+        } catch {}
+    }, 500);
+
+    const rects = selections.map(s => ({
+        cx: (s.x + s.w / 2) / previewScale,
+        cy: (s.y + s.h / 2) / previewScale,
+        w: s.w / previewScale,
+        h: s.h / previewScale,
+        angle: s.angle * 180 / Math.PI,
+    }));
+    try {
+        const resp = await fetch('/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ basename, rects }),
+        });
+        const result = await resp.json();
+        statusEl.textContent = result.message;
+    } catch (e) {
+        statusEl.textContent = 'Export failed: ' + e.message;
+    }
+    clearInterval(pollId);
+    exportBtn.disabled = false;
+    exportBtn.textContent = 'Export all';
+});
+
+// --- Resize handling ---
+window.addEventListener('resize', () => { render(); });
+
+// --- Keyboard ---
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (activeIdx >= 0 && document.activeElement.tagName !== 'INPUT') {
+            selections.splice(activeIdx, 1);
+            activeIdx = Math.min(activeIdx, selections.length - 1);
+            updateSelList(); render();
+        }
+    }
+});
+</script>
+</body>
+</html>
