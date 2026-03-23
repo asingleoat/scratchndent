@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+
+# Scan files (large)
+*.tif
+*.tiff
+
+# RawTherapee sidecars
+*.pp3
+
+# Export output
+frames/
+
+# Per-user/per-roll config
+scratchndent_config.toml
+
+# Claude Code
+memory/
