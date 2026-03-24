@@ -527,6 +527,22 @@ class Handler(BaseHTTPRequestHandler):
                 "current": IMAGE_IDX,
             }
             self._respond(200, "application/json", json.dumps(data).encode())
+        elif parsed.path == "/gallery":
+            gallery_path = Path(__file__).parent / "gallery.html"
+            self._respond(200, "text/html", gallery_path.read_bytes())
+        elif parsed.path == "/gallery/list":
+            export_files = sorted(
+                p.name for p in OUTPUT_DIR.iterdir()
+                if p.is_file() and p.suffix.lower() in TIFF_EXTS
+            ) if OUTPUT_DIR.exists() else []
+            self._respond(200, "application/json",
+                          json.dumps({"files": export_files}).encode())
+        elif parsed.path.startswith("/gallery/thumb/"):
+            name = parsed.path[len("/gallery/thumb/"):]
+            self._serve_export_jpeg(name, max_dim=200)
+        elif parsed.path.startswith("/gallery/full/"):
+            name = parsed.path[len("/gallery/full/"):]
+            self._serve_export_jpeg(name, max_dim=2400)
         else:
             self._respond(404, "text/plain", b"Not found")
 
@@ -591,6 +607,31 @@ class Handler(BaseHTTPRequestHandler):
                           json.dumps({"ok": True}).encode())
         else:
             self._respond(404, "text/plain", b"Not found")
+
+    def _serve_export_jpeg(self, name: str, max_dim: int = 2400):
+        """Serve an exported TIFF as a JPEG preview."""
+        from urllib.parse import unquote
+        name = unquote(name)
+        path = OUTPUT_DIR / name
+        if not path.exists() or not path.is_file():
+            self._respond(404, "text/plain", b"Not found")
+            return
+        try:
+            with tifffile.TiffFile(str(path)) as tif:
+                img = tif.pages[0].asarray()
+            if img.dtype == np.uint16:
+                img = (img >> 8).astype(np.uint8)
+            h, w = img.shape[:2]
+            scale = min(max_dim / max(h, w), 1.0)
+            if scale < 1.0:
+                img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                                 interpolation=cv2.INTER_AREA)
+            pil_img = Image.fromarray(img)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            self._respond(200, "image/jpeg", buf.getvalue())
+        except Exception as e:
+            self._respond(500, "text/plain", str(e).encode())
 
     def _respond(self, code, content_type, data):
         self.send_response(code)
@@ -824,8 +865,16 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Browser-based frame extraction from scanned film strips",
+        epilog="Examples:\n"
+               "  python extract.py scan.tiff              # single file\n"
+               "  python extract.py /path/to/scans/        # whole directory\n"
+               "  python extract.py . --stock kodak_gold   # current dir + inversion",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input", help="Input TIFF file or directory of TIFFs")
+    parser.add_argument(
+        "input", nargs="?", default=None,
+        help="Input TIFF file or directory of TIFFs to process",
+    )
     parser.add_argument("--port", type=int, default=8888)
     parser.add_argument(
         "--output-dir", type=str, default="frames",
@@ -852,6 +901,10 @@ def main():
         help="Disable automatic IR dust/scratch removal",
     )
     args = parser.parse_args()
+
+    if args.input is None:
+        parser.print_help()
+        sys.exit(1)
 
     OUTPUT_DIR = Path(args.output_dir)
     FILM_STOCK = args.stock

@@ -87,6 +87,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <label>Base name:</label>
     <input id="basename" value="" style="width:100px">
     <button id="btn-export" class="primary">Export all</button>
+    <button id="btn-gallery" onclick="window.open('/gallery','_blank')">View Exports</button>
 </div>
 <div id="loading-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
     background:rgba(0,0,0,0.7);z-index:200;align-items:center;justify-content:center;
@@ -199,7 +200,21 @@ fetch('/info').then(r => r.json()).then(updateImageInfo);
 
 async function switchImage(idx) {
     overlay.style.display = 'flex';
-    selections = []; activeIdx = -1; rebateRect = null; updateSelList();
+    // Save current selections for carry-over to next image
+    if (selections.length > 0 && !selectionsAreInherited) {
+        previousSelections = selections.map(s => ({...s}));
+    }
+    // Restore previous selections (user can modify or clear them)
+    if (previousSelections.length > 0) {
+        selections = previousSelections.map(s => ({...s}));
+        activeIdx = 0;
+        selectionsAreInherited = true;
+    } else {
+        selections = [];
+        activeIdx = -1;
+    }
+    rebateRect = null;
+    updateSelList();
     const resp = await fetch('/switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -268,7 +283,11 @@ function getAspect() {
 // --- Selection model ---
 let lastAngle = 0, lastW = 0, lastH = 0;
 let lastRotation = 270; // default: 270° CW (scanner vertical, photos landscape)
+let previousSelections = []; // saved from last image for carry-over
+let selectionsAreInherited = false; // true if current selections came from previous image
+
 function addSelection(x, y, w, h, angle = lastAngle) {
+    selectionsAreInherited = false; // user is making manual selections
     selections.push({ x, y, w, h, angle, rotation: lastRotation });
     activeIdx = selections.length - 1;
     updateSelList();
@@ -455,6 +474,7 @@ canvas.addEventListener('mousedown', (e) => {
     const hit = hitTest(mx, my);
 
     if (hit) {
+        selectionsAreInherited = false; // user is interacting with selections
         activeIdx = hit.idx;
         const s = selections[hit.idx];
         if (hit.type === 'move') {
@@ -674,6 +694,7 @@ document.getElementById('btn-next').addEventListener('click', () => {
 });
 
 document.getElementById('btn-clear').addEventListener('click', () => {
+    selectionsAreInherited = false;
     selections = []; activeIdx = -1; updateSelList(); render();
 });
 
@@ -729,6 +750,7 @@ window.addEventListener('resize', () => { render(); });
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
         if (activeIdx >= 0 && document.activeElement.tagName !== 'INPUT') {
+            selectionsAreInherited = false;
             selections.splice(activeIdx, 1);
             activeIdx = Math.min(activeIdx, selections.length - 1);
             updateSelList(); render();
