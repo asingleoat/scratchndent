@@ -42,6 +42,31 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     background: #2a2a2a; border-top: 1px solid #444; padding: 0 12px;
     font-size: 12px; line-height: 24px; color: #888; z-index: 100;
 }
+.settings-group {
+    border-top: 1px solid #444; margin-top: 8px; padding-top: 6px;
+}
+.settings-group summary {
+    font-size: 12px; color: #888; cursor: pointer; padding: 2px 0;
+    user-select: none;
+}
+.settings-group summary:hover { color: #aaa; }
+.settings-group[open] summary { color: #aaa; margin-bottom: 6px; }
+.param-row {
+    display: flex; flex-direction: column; margin-bottom: 8px;
+}
+.param-row label {
+    font-size: 11px; color: #999; margin-bottom: 2px;
+}
+.param-row .param-ctrl {
+    display: flex; align-items: center; gap: 4px;
+}
+.param-row input[type="range"] {
+    flex: 1; height: 4px; accent-color: #2d6;
+}
+.param-row .param-val {
+    font-size: 11px; color: #ccc; min-width: 36px; text-align: right;
+    font-variant-numeric: tabular-nums;
+}
 </style>
 </head>
 <body>
@@ -98,6 +123,98 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
 <div id="sidebar">
     <div style="padding:4px 0 8px;font-size:13px;color:#888;">Selections</div>
     <div id="sel-list"></div>
+
+    <details class="settings-group" id="settings-render">
+        <summary>Rendering</summary>
+        <div class="param-row" title="S-curve contrast strength. 1.0 = no contrast adjustment (linear), higher values darken shadows and brighten highlights for more punch">
+            <label>Contrast</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="render_contrast" min="1.0" max="2.0" step="0.05">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Multiplier for the S-curve steepness. Higher values make the contrast curve sharper at the midpoint. Interacts with Contrast setting">
+            <label>Curve steepness</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="render_curve_k" min="2.0" max="10.0" step="0.5">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Percentile of image data used as the black point. Higher values clip more shadow detail but can reduce haze in low-contrast scans">
+            <label>Black percentile</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="render_percentile_lo" min="0.0" max="5.0" step="0.1">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Percentile of image data used as the white point. Lower values clip more highlight detail but can prevent washed-out highlights">
+            <label>White percentile</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="render_percentile_hi" min="95.0" max="100.0" step="0.1">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Shift the overall brightness in density space before rendering. Positive values produce a brighter image, negative values darken it">
+            <label>Exposure compensation</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="exposure_compensation" min="-0.5" max="0.5" step="0.01">
+                <span class="param-val"></span>
+            </div>
+        </div>
+    </details>
+
+    <details class="settings-group" id="settings-ir">
+        <summary>Dust &amp; Scratch Removal</summary>
+        <div class="param-row" title="How far below the local background a pixel must be to count as a defect. Lower values detect fainter dust but may flag film grain. Higher values only catch obvious defects">
+            <label>Detection threshold</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_threshold" min="0.10" max="0.50" step="0.01">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Meijering ridge filter threshold for detecting thin linear features like hairs and scratches. Lower values catch finer/fainter hairs but may produce false positives on textured areas">
+            <label>Hair sensitivity</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_hair_sensitivity" min="0.02" max="0.30" step="0.01">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Expand detected defect regions by this many pixels. Ensures the inpainter covers the full extent of each defect including soft edges">
+            <label>Dilate radius</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_dilate_radius" min="0" max="10" step="1">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Morphological close operation radius. Fills small gaps within partially-detected large defects, connecting nearby detected regions into a single defect">
+            <label>Close radius</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_close_radius" min="0" max="15" step="1">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Detected regions smaller than this many pixels are discarded as noise. Increase to ignore tiny specks, decrease to catch very small dust particles">
+            <label>Min defect area (px)</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_min_area" min="1" max="20" step="1">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Safety limit: if more than this fraction of the image is flagged as defects, the detection is assumed to be wrong and no cleaning is performed. Prevents destroying the image when thresholds are too aggressive">
+            <label>Max coverage (%)</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="ir_max_coverage" min="0.005" max="0.10" step="0.005">
+                <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="How many pixels of clean image context to include around each defect when inpainting. More padding gives the inpainter better context for reconstruction but is slower for large defects">
+            <label>Inpaint padding (px)</label>
+            <div class="param-ctrl">
+                <input type="range" data-param="inpaint_padding" min="4" max="48" step="2">
+                <span class="param-val"></span>
+            </div>
+        </div>
+    </details>
 </div>
 <div id="status">Ready</div>
 
@@ -171,6 +288,43 @@ function updateDminDisplay(dmin) {
         dminEl.style.color = '#666';
     }
 }
+// Parameter defaults (must match PARAM_DEFAULTS in extract.py)
+const PARAM_DEFAULTS = {
+    ir_threshold: 0.25, ir_hair_sensitivity: 0.10, ir_min_area: 3,
+    ir_dilate_radius: 4, ir_close_radius: 6, ir_max_coverage: 0.03,
+    inpaint_padding: 16, render_contrast: 1.2, render_curve_k: 5.0,
+    render_percentile_lo: 0.5, render_percentile_hi: 99.5,
+    exposure_compensation: 0.0,
+};
+
+function initParamSliders(cfg) {
+    document.querySelectorAll('[data-param]').forEach(input => {
+        const key = input.dataset.param;
+        const val = cfg[key] !== undefined ? cfg[key] : PARAM_DEFAULTS[key];
+        input.value = val;
+        const display = input.parentElement.querySelector('.param-val');
+        if (display) display.textContent = val;
+
+        input.addEventListener('input', () => {
+            const v = parseFloat(input.value);
+            if (display) display.textContent = Number.isInteger(v) ? v : v.toFixed(
+                input.step && input.step.includes('.') ? input.step.split('.')[1].length : 2
+            );
+        });
+        input.addEventListener('change', () => {
+            const v = parseFloat(input.value);
+            if (display) display.textContent = Number.isInteger(v) ? v : v.toFixed(
+                input.step && input.step.includes('.') ? input.step.split('.')[1].length : 2
+            );
+            fetch('/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ [key]: v }),
+            });
+        });
+    });
+}
+
 fetch('/settings').then(r => r.json()).then(cfg => {
     if (cfg.aspect) {
         document.getElementById('aspect').value = cfg.aspect;
@@ -182,6 +336,7 @@ fetch('/settings').then(r => r.json()).then(cfg => {
         document.getElementById('chk-invert').checked = cfg.invert;
     }
     updateDminDisplay(cfg.dmin || null);
+    initParamSliders(cfg);
 });
 
 function updateImageInfo(info) {
