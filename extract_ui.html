@@ -60,8 +60,15 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
 .param-row .param-ctrl {
     display: flex; align-items: center; gap: 4px;
 }
+.param-row .slider-wrap {
+    flex: 1; position: relative; height: 16px; display: flex; align-items: center;
+}
 .param-row input[type="range"] {
-    flex: 1; height: 4px; accent-color: #2d6;
+    width: 100%; height: 4px; accent-color: #2d6; margin: 0;
+}
+.param-row .default-tick {
+    position: absolute; top: 0; width: 1px; height: 100%;
+    background: #f90; pointer-events: none; opacity: 0.7;
 }
 .param-row .param-val {
     font-size: 11px; color: #ccc; min-width: 36px; text-align: right;
@@ -297,25 +304,42 @@ const PARAM_DEFAULTS = {
     exposure_compensation: 0.0,
 };
 
+function fmtVal(v, step) {
+    if (Number.isInteger(v) && (!step || !step.includes('.'))) return String(v);
+    const decimals = step && step.includes('.') ? step.split('.')[1].length : 2;
+    return v.toFixed(decimals);
+}
+
 function initParamSliders(cfg) {
     document.querySelectorAll('[data-param]').forEach(input => {
         const key = input.dataset.param;
-        const val = cfg[key] !== undefined ? cfg[key] : PARAM_DEFAULTS[key];
+        const defaultVal = PARAM_DEFAULTS[key];
+        const val = cfg[key] !== undefined ? cfg[key] : defaultVal;
         input.value = val;
         const display = input.parentElement.querySelector('.param-val');
-        if (display) display.textContent = val;
+        if (display) display.textContent = fmtVal(val, input.step);
+
+        // Wrap slider in a container and add default tick mark
+        const wrap = document.createElement('div');
+        wrap.className = 'slider-wrap';
+        input.parentNode.insertBefore(wrap, input);
+        wrap.appendChild(input);
+
+        const tick = document.createElement('div');
+        tick.className = 'default-tick';
+        tick.title = `Default: ${fmtVal(defaultVal, input.step)}`;
+        const min = parseFloat(input.min), max = parseFloat(input.max);
+        const pct = ((defaultVal - min) / (max - min)) * 100;
+        tick.style.left = `${pct}%`;
+        wrap.appendChild(tick);
 
         input.addEventListener('input', () => {
             const v = parseFloat(input.value);
-            if (display) display.textContent = Number.isInteger(v) ? v : v.toFixed(
-                input.step && input.step.includes('.') ? input.step.split('.')[1].length : 2
-            );
+            if (display) display.textContent = fmtVal(v, input.step);
         });
         input.addEventListener('change', () => {
             const v = parseFloat(input.value);
-            if (display) display.textContent = Number.isInteger(v) ? v : v.toFixed(
-                input.step && input.step.includes('.') ? input.step.split('.')[1].length : 2
-            );
+            if (display) display.textContent = fmtVal(v, input.step);
             fetch('/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
