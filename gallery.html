@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Exported Frames</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; }
+#toolbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 48px; z-index: 100;
+    background: #2a2a2a; display: flex; align-items: center; padding: 0 16px; gap: 12px;
+    border-bottom: 1px solid #444;
+}
+#toolbar label { font-size: 13px; color: #aaa; }
+#toolbar select, #toolbar button {
+    font-size: 13px; padding: 4px 8px; border-radius: 4px; border: 1px solid #555;
+    background: #333; color: #eee; cursor: pointer;
+}
+#toolbar button:hover { background: #444; }
+#view-area {
+    position: fixed; top: 48px; left: 0; right: 0; bottom: 0;
+    display: flex; flex-direction: column;
+}
+#thumb-strip {
+    height: 140px; min-height: 140px;
+    background: #222; border-bottom: 1px solid #444;
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px; overflow-x: auto;
+}
+.thumb {
+    height: 120px; border-radius: 4px; cursor: pointer;
+    border: 2px solid transparent; flex-shrink: 0;
+    object-fit: contain; background: #111;
+}
+.thumb.active { border-color: #2d6; }
+.thumb:hover { border-color: #888; }
+#main-view {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; padding: 16px;
+}
+#main-view img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+}
+#status {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 24px;
+    background: #2a2a2a; border-top: 1px solid #444; padding: 0 12px;
+    font-size: 12px; line-height: 24px; color: #888; z-index: 100;
+}
+#empty-msg {
+    color: #666; font-size: 16px; text-align: center; margin-top: 100px;
+}
+</style>
+</head>
+<body>
+<div id="toolbar">
+    <button id="btn-prev" title="Previous">&larr;</button>
+    <select id="file-select"></select>
+    <button id="btn-next" title="Next">&rarr;</button>
+    <span style="flex:1"></span>
+    <button onclick="refreshList()">Refresh</button>
+</div>
+<div id="view-area">
+    <div id="thumb-strip"></div>
+    <div id="main-view">
+        <div id="empty-msg">No exported frames yet</div>
+    </div>
+</div>
+<div id="status">Ready</div>
+
+<script>
+const fileSelect = document.getElementById('file-select');
+const thumbStrip = document.getElementById('thumb-strip');
+const mainView = document.getElementById('main-view');
+const statusEl = document.getElementById('status');
+
+let files = [];
+let currentIdx = -1;
+
+function refreshList() {
+    fetch('/gallery/list').then(r => r.json()).then(data => {
+        files = data.files;
+        fileSelect.innerHTML = '';
+        thumbStrip.innerHTML = '';
+
+        if (files.length === 0) {
+            mainView.innerHTML = '<div id="empty-msg">No exported frames yet</div>';
+            statusEl.textContent = 'No exports found';
+            currentIdx = -1;
+            return;
+        }
+
+        files.forEach((name, i) => {
+            // Dropdown
+            const opt = document.createElement('option');
+            opt.value = i;
+            opt.textContent = `${i + 1}/${files.length}: ${name}`;
+            fileSelect.appendChild(opt);
+
+            // Thumbnail
+            const img = document.createElement('img');
+            img.className = 'thumb';
+            img.src = `/gallery/thumb/${encodeURIComponent(name)}`;
+            img.title = name;
+            img.addEventListener('click', () => showImage(i));
+            thumbStrip.appendChild(img);
+        });
+
+        // Show first image or keep current
+        if (currentIdx < 0 || currentIdx >= files.length) {
+            showImage(0);
+        } else {
+            showImage(currentIdx);
+        }
+        statusEl.textContent = `${files.length} exported frame${files.length !== 1 ? 's' : ''}`;
+    });
+}
+
+function showImage(idx) {
+    if (idx < 0 || idx >= files.length) return;
+    currentIdx = idx;
+    fileSelect.value = idx;
+
+    // Update thumbnail highlights
+    const thumbs = thumbStrip.querySelectorAll('.thumb');
+    thumbs.forEach((t, i) => t.classList.toggle('active', i === idx));
+    // Scroll active thumb into view
+    if (thumbs[idx]) thumbs[idx].scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+
+    const name = files[idx];
+    mainView.innerHTML = `<img src="/gallery/full/${encodeURIComponent(name)}">`;
+    statusEl.textContent = `${idx + 1}/${files.length}: ${name}`;
+}
+
+fileSelect.addEventListener('change', () => showImage(parseInt(fileSelect.value)));
+fileSelect.addEventListener('focus', refreshList);
+
+document.getElementById('btn-prev').addEventListener('click', () => {
+    if (files.length > 0) showImage(currentIdx > 0 ? currentIdx - 1 : files.length - 1);
+});
+document.getElementById('btn-next').addEventListener('click', () => {
+    if (files.length > 0) showImage(currentIdx < files.length - 1 ? currentIdx + 1 : 0);
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); document.getElementById('btn-prev').click(); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-next').click(); }
+});
+
+refreshList();
+</script>
+</body>
+</html>
