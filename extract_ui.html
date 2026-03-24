@@ -80,6 +80,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label><input type="checkbox" id="chk-ir" checked> IR clean</label>
+    <label><input type="checkbox" id="chk-invert" checked> Invert</label>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <span id="dmin-display" style="font-size:11px;color:#888"></span>
     <span style="flex:1"></span>
@@ -176,6 +177,9 @@ fetch('/settings').then(r => r.json()).then(cfg => {
     if (cfg.ir_clean !== undefined) {
         document.getElementById('chk-ir').checked = cfg.ir_clean;
     }
+    if (cfg.invert !== undefined) {
+        document.getElementById('chk-invert').checked = cfg.invert;
+    }
     updateDminDisplay(cfg.dmin || null);
 });
 
@@ -244,6 +248,13 @@ document.getElementById('chk-ir').addEventListener('change', (e) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ir_clean: e.target.checked }),
+    });
+});
+document.getElementById('chk-invert').addEventListener('change', (e) => {
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invert: e.target.checked }),
     });
 });
 
@@ -695,7 +706,11 @@ document.getElementById('btn-export').addEventListener('click', async () => {
         const resp = await fetch('/export', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ basename, rects, ir_clean: document.getElementById('chk-ir').checked }),
+            body: JSON.stringify({
+            basename, rects,
+            ir_clean: document.getElementById('chk-ir').checked,
+            invert: document.getElementById('chk-invert').checked,
+        }),
         });
         const result = await resp.json();
         statusEl.textContent = result.message;

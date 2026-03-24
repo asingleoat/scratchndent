@@ -17,7 +17,9 @@ import json
 import math
 import sys
 import threading
+import time
 import webbrowser
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -598,95 +600,192 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _process_frame(
+    frame_idx: int,
+    rect: dict,
+    rgb_img: np.ndarray,
+    aligned_ir: np.ndarray | None,
+    ir_scale_x: float,
+    ir_scale_y: float,
+    film_stock: str | None,
+    dmin: np.ndarray | None,
+    out_path: str,
+    meta: dict,
+) -> dict:
+    """Process and export a single frame. Designed to run in a worker process."""
+    timings = {}
+    t0 = time.monotonic()
+
+    cx, cy, w, h = rect["cx"], rect["cy"], rect["w"], rect["h"]
+    angle = rect.get("angle", 0)
+
+    t = time.monotonic()
+    cropped = crop_rotated_rect(rgb_img, cx, cy, w, h, angle)
+    timings["crop"] = time.monotonic() - t
+
+    # Per-crop IR cleaning
+    if aligned_ir is not None:
+        t = time.monotonic()
+        ir_cropped = crop_rotated_rect(
+            aligned_ir,
+            cx * ir_scale_x, cy * ir_scale_y,
+            w * ir_scale_x, h * ir_scale_y,
+            angle,
+        )
+        cropped = ir_clean_region(cropped, ir_cropped)
+        timings["ir_clean"] = time.monotonic() - t
+
+    if film_stock:
+        t = time.monotonic()
+        scene_linear = invert_negative(
+            cropped,
+            dmin=dmin,
+            stock=film_stock,
+            exposure_compensation=get_param("exposure_compensation"),
+        )
+        timings["invert"] = time.monotonic() - t
+
+        t = time.monotonic()
+        cropped = render_to_display(
+            scene_linear,
+            contrast=get_param("render_contrast"),
+            curve_k=get_param("render_curve_k"),
+            percentile_lo=get_param("render_percentile_lo"),
+            percentile_hi=get_param("render_percentile_hi"),
+        )
+        timings["render"] = time.monotonic() - t
+
+    # Apply output rotation
+    rotation = rect.get("rotation", 0)
+    if rotation == 90:
+        cropped = np.rot90(cropped, k=-1)
+    elif rotation == 180:
+        cropped = np.rot90(cropped, k=2)
+    elif rotation == 270:
+        cropped = np.rot90(cropped, k=1)
+
+    t = time.monotonic()
+    meta_json = json.dumps(meta)
+    tifffile.imwrite(out_path, cropped, extratags=[
+        (65000, 's', 0, meta_json, True),
+    ])
+    timings["write"] = time.monotonic() - t
+
+    timings["total"] = time.monotonic() - t0
+    return {"out_path": out_path, "timings": timings,
+            "shape": (cropped.shape[1], cropped.shape[0])}
+
+
 def handle_export(body: dict) -> dict:
-    # Default basename from input filename (e.g. "untitled" from "untitled.tif")
     default_base = Path(INPUT_PATH).stem
     basename = body.get("basename", default_base)
     rects = body.get("rects", [])
     ir_clean = body.get("ir_clean", True)
+    invert = body.get("invert", True)
     n_rects = len(rects)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    exported = []
 
+    t_start = time.monotonic()
     set_progress(f"Preparing full-res export ({n_rects} frame{'s' if n_rects != 1 else ''})...")
+
+    t = time.monotonic()
     ensure_loaded()
+    t_load = time.monotonic() - t
     if DMIN is not None:
         print(f"  Dmin: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
-    if REBATE_RECT:
-        print(f"  Rebate: {REBATE_RECT}")
 
-    # Align IR once if IR cleaning is requested and we have an IR channel
+    # Align IR once (shared across all frames)
     aligned_ir = None
     ir_scale_x = ir_scale_y = 1.0
+    t_align = 0.0
     if ir_clean and FULL_IR is not None:
         set_progress("Aligning IR channel (full strip)...")
+        t = time.monotonic()
         aligned_ir = align_ir(FULL_IMG, FULL_IR)
-        # Compute scale factor from RGB to IR coordinates
+        t_align = time.monotonic() - t
         rgb_h, rgb_w = FULL_IMG.shape[:2]
         ir_h, ir_w = aligned_ir.shape[:2]
         ir_scale_x = ir_w / rgb_w
         ir_scale_y = ir_h / rgb_h
 
+    # Build output paths and metadata for each frame
+    frame_jobs = []
     for i, r in enumerate(rects):
-        set_progress(f"Cropping frame {i + 1}/{n_rects}...")
         cx, cy, w, h = r["cx"], r["cy"], r["w"], r["h"]
         angle = r.get("angle", 0)
 
-        cropped = crop_rotated_rect(FULL_IMG, cx, cy, w, h, angle)
-
-        # Per-crop IR cleaning — crop IR at its own resolution
-        if aligned_ir is not None:
-            set_progress(f"IR cleaning frame {i + 1}/{n_rects}...")
-            ir_cropped = crop_rotated_rect(
-                aligned_ir,
-                cx * ir_scale_x, cy * ir_scale_y,
-                w * ir_scale_x, h * ir_scale_y,
-                angle,
-            )
-            cropped = ir_clean_region(cropped, ir_cropped)
-
-        if FILM_STOCK:
-            set_progress(f"Inverting frame {i + 1}/{n_rects}...")
-            cropped = apply_inversion(cropped)
-
-        # Apply output rotation (0, 90, 180, 270 degrees CW)
-        rotation = r.get("rotation", 0)
-        if rotation == 90:
-            cropped = np.rot90(cropped, k=-1)
-        elif rotation == 180:
-            cropped = np.rot90(cropped, k=2)
-        elif rotation == 270:
-            cropped = np.rot90(cropped, k=1)
-
         out_name = f"{basename}_{i + 1:02d}.tif"
         out_path = OUTPUT_DIR / out_name
-        # Don't overwrite existing files
         n = 1
         while out_path.exists():
             out_name = f"{basename}_{i + 1:02d}_{n}.tif"
             out_path = OUTPUT_DIR / out_name
             n += 1
-        set_progress(f"Writing {out_name} ({cropped.shape[1]}x{cropped.shape[0]})...")
-        # Embed processing metadata in TIFF Software tag (single-valued,
-        # avoids duplicate ImageDescription that breaks Apple Preview)
+
         meta = {
             "source": Path(INPUT_PATH).name,
-            "stock": FILM_STOCK,
-            "contrast": get_param("render_contrast"),
+            "stock": FILM_STOCK if invert else None,
+            "contrast": get_param("render_contrast") if invert else None,
             "ir_clean": ir_clean and aligned_ir is not None,
-            "dmin": DMIN.tolist() if DMIN is not None else None,
+            "invert": invert,
+            "dmin": DMIN.tolist() if DMIN is not None and invert else None,
             "rebate_rect": REBATE_RECT,
             "crop": {"cx": cx, "cy": cy, "w": w, "h": h, "angle": angle},
         }
-        meta_json = json.dumps(meta)
-        tifffile.imwrite(str(out_path), cropped, extratags=[
-            # Tag 65000: private tag for scratchndent metadata
-            (65000, 's', 0, meta_json, True),
-        ])
-        exported.append(out_name)
+        frame_jobs.append((i, r, str(out_path), out_name, meta))
 
-    msg = f"Exported {len(exported)} frame{'s' if len(exported) != 1 else ''} to {OUTPUT_DIR}/"
+    # Process frames in parallel
+    set_progress(f"Processing {n_rects} frame{'s' if n_rects != 1 else ''} in parallel...")
+    exported = [None] * n_rects
+    all_timings = [None] * n_rects
+
+    film_stock = FILM_STOCK if invert else None
+
+    if n_rects == 1:
+        # Single frame — no pool overhead
+        i, r, out_path, out_name, meta = frame_jobs[0]
+        result = _process_frame(
+            i, r, FULL_IMG, aligned_ir, ir_scale_x, ir_scale_y,
+            film_stock, DMIN, out_path, meta,
+        )
+        exported[0] = out_name
+        all_timings[0] = result["timings"]
+        set_progress(f"Wrote {out_name} ({result['shape'][0]}x{result['shape'][1]})")
+    else:
+        # Multiple frames — use thread pool (numpy/numba release GIL)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(n_rects, 4)) as pool:
+            futures = {}
+            for i, r, out_path, out_name, meta in frame_jobs:
+                fut = pool.submit(
+                    _process_frame,
+                    i, r, FULL_IMG, aligned_ir, ir_scale_x, ir_scale_y,
+                    film_stock, DMIN, out_path, meta,
+                )
+                futures[fut] = (i, out_name)
+
+            for fut in as_completed(futures):
+                i, out_name = futures[fut]
+                result = fut.result()
+                exported[i] = out_name
+                all_timings[i] = result["timings"]
+                set_progress(f"Wrote {out_name} ({result['shape'][0]}x{result['shape'][1]})")
+
+    t_total = time.monotonic() - t_start
+
+    # Print timing summary
+    print(f"\n  === Export timing summary ===")
+    print(f"  Load:      {t_load:.2f}s")
+    if t_align > 0:
+        print(f"  IR align:  {t_align:.2f}s")
+    for i, timings in enumerate(all_timings):
+        if timings:
+            parts = " | ".join(f"{k}: {v:.2f}s" for k, v in timings.items())
+            print(f"  Frame {i+1}:   {parts}")
+    print(f"  Total:     {t_total:.2f}s\n")
+
+    msg = f"Exported {len(exported)} frame{'s' if len(exported) != 1 else ''} to {OUTPUT_DIR}/ ({t_total:.1f}s)"
     set_progress(msg)
     return {"message": msg, "files": exported}
 

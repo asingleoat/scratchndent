@@ -141,35 +141,34 @@ def make_defect_mask(
 
     Returns a uint8 mask where 255 = defect, 0 = clean.
     """
+    import time as _time
+
     ir_max = float(ir.max()) if ir.max() > 0 else 1.0
     ir_f = ir.astype(np.float32) / ir_max
+    h_ir, w_ir = ir_f.shape[:2]
+    print(f"    make_defect_mask: {w_ir}x{h_ir}, {ir_f.size/1e6:.1f}M pixels")
 
     # --- Adaptive ratio-based detection ---
 
-    # Large blur for local background estimate
+    t = _time.monotonic()
     background = cv2.GaussianBlur(ir_f, (blur_size, blur_size), 0)
-
-    # Local standard deviation for adaptive thresholding
     ir_sq = cv2.GaussianBlur(ir_f ** 2, (blur_size, blur_size), 0)
     local_var = np.maximum(ir_sq - background ** 2, 0.0)
     local_std = np.sqrt(local_var)
+    t_blur1 = _time.monotonic() - t
 
-    # Defect score: how many local std devs below the background?
-    # This is exposure-independent because both background and std
-    # scale with overall brightness.
+    t = _time.monotonic()
     with np.errstate(divide='ignore', invalid='ignore'):
         deficit = background - ir_f
         n_sigma = np.where(local_std > 1e-4, deficit / local_std, 0.0)
-
-    # Also compute a ratio for the two-pass refinement
-    with np.errstate(divide='ignore', invalid='ignore'):
         ratio = np.where(background > 0.01, ir_f / background, 1.0)
 
-    # Threshold on n_sigma (adaptive) AND ratio (absolute floor)
-    sigma_threshold = 2.5 / threshold  # threshold=0.25 → 10 sigma
+    sigma_threshold = 2.5 / threshold
     coarse_mask = (n_sigma > sigma_threshold) & (ratio < (1.0 - threshold * 0.7))
+    t_pass1 = _time.monotonic() - t
 
-    # Two-pass: replace detected defects with background, re-estimate
+    # Two-pass refinement
+    t = _time.monotonic()
     ir_cleaned = ir_f.copy()
     ir_cleaned[coarse_mask] = background[coarse_mask]
     background2 = cv2.GaussianBlur(ir_cleaned, (blur_size, blur_size), 0)
@@ -182,41 +181,46 @@ def make_defect_mask(
         ratio2 = np.where(background2 > 0.01, ir_f / background2, 1.0)
 
     dust_mask = (n_sigma2 > sigma_threshold) & (ratio2 < (1.0 - threshold * 0.7))
+    t_pass2 = _time.monotonic() - t
 
     n_dust = np.count_nonzero(dust_mask)
-    print(f"    Dust detection: {n_dust} pixels ({100*n_dust/dust_mask.size:.2f}%)")
+    print(f"    Dust: {n_dust} px ({100*n_dust/dust_mask.size:.2f}%) "
+          f"[blur1={t_blur1:.2f}s pass1={t_pass1:.2f}s pass2={t_pass2:.2f}s]")
 
     # --- Line-based detection (hairs, fine scratches) ---
 
+    t = _time.monotonic()
     scale = 0.25
-    # Use the n_sigma map for line detection — it's exposure-normalized
     nsig_small = cv2.resize(
         np.clip(n_sigma2, 0, None).astype(np.float32),
         None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA,
     ).astype(np.float64)
-    # Normalize to [0, 1] range for Meijering
     nsig_max = np.percentile(nsig_small, 99.9)
     if nsig_max > 0:
         nsig_norm = np.clip(nsig_small / nsig_max, 0, 1)
     else:
         nsig_norm = nsig_small
+    t_prep = _time.monotonic() - t
 
+    t = _time.monotonic()
     line_response = meijering(nsig_norm, sigmas=range(1, 9), black_ridges=False)
-    line_mask_small = (line_response > hair_sensitivity).astype(np.uint8) * 255
+    t_meijering = _time.monotonic() - t
 
+    t = _time.monotonic()
+    line_mask_small = (line_response > hair_sensitivity).astype(np.uint8) * 255
     line_mask = cv2.resize(line_mask_small, (ir_f.shape[1], ir_f.shape[0]),
                            interpolation=cv2.INTER_NEAREST)
-
-    # Gate: only keep line detections where there's a meaningful IR deficit
     line_mask[n_sigma2 < sigma_threshold * 0.2] = 0
+    t_gate = _time.monotonic() - t
 
     n_lines = np.count_nonzero(line_mask)
-    print(f"    Line detection: {n_lines} pixels ({100*n_lines/line_mask.size:.2f}%)")
+    print(f"    Lines: {n_lines} px ({100*n_lines/line_mask.size:.2f}%) "
+          f"[prep={t_prep:.2f}s meijering={t_meijering:.2f}s gate={t_gate:.2f}s]")
 
-    # --- Combine both masks ---
+    # --- Combine + morphology ---
+    t = _time.monotonic()
     mask = np.where(dust_mask, 255, line_mask).astype(np.uint8)
 
-    # Morphological close to fill holes within partially-detected large defects
     if close_radius > 0:
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -224,7 +228,6 @@ def make_defect_mask(
         )
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
 
-    # Remove tiny specks (noise)
     if min_area > 0:
         n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             mask, connectivity=8
@@ -233,16 +236,17 @@ def make_defect_mask(
             if stats[i, cv2.CC_STAT_AREA] < min_area:
                 mask[labels == i] = 0
 
-    # Dilate to ensure full coverage of defect edges
     if dilate_radius > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (2 * dilate_radius + 1, 2 * dilate_radius + 1),
         )
         mask = cv2.dilate(mask, kernel)
+    t_morph = _time.monotonic() - t
 
-    # Sanity check
     coverage = np.count_nonzero(mask) / mask.size
+    print(f"    Morphology: {t_morph:.2f}s | final coverage: {100*coverage:.2f}%")
+
     if coverage > max_coverage:
         print(f"WARNING: defect mask covers {100*coverage:.1f}% of image — "
               f"returning empty mask.", file=sys.stderr)
@@ -399,6 +403,9 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
     smooth signal, then adds synthesized film grain matched to the local
     surround so repaired regions blend naturally with the noisy film.
     """
+    import time as _time
+    t_start = _time.monotonic()
+
     result = rgb.copy()
     rgb_max = float(np.iinfo(rgb.dtype).max) if np.issubdtype(rgb.dtype, np.integer) else 1.0
     h, w = mask.shape
@@ -410,9 +417,14 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
     if n_defects == 0:
         return result
 
+    print(f"    Inpainting {n_defects} regions...")
     for i in range(1, n_labels):
-        if i % 500 == 0:
-            print(f"  Inpainting region {i}/{n_defects}...")
+        if i % 200 == 0:
+            elapsed = _time.monotonic() - t_start
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (n_defects - i) / rate if rate > 0 else 0
+            print(f"    Inpainting region {i}/{n_defects} "
+                  f"({elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)")
 
         x = stats[i, cv2.CC_STAT_LEFT]
         y = stats[i, cv2.CC_STAT_TOP]
@@ -450,4 +462,7 @@ def inpaint(rgb: np.ndarray, mask: np.ndarray, padding: int = 16) -> np.ndarray:
             .astype(rgb.dtype)
         )
 
+    t_total = _time.monotonic() - t_start
+    print(f"    Inpaint done: {n_defects} regions in {t_total:.2f}s "
+          f"({n_defects/t_total:.0f} regions/s)" if t_total > 0 else "")
     return result
