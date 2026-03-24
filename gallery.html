@@ -96,6 +96,9 @@ function applyTransform() {
 
 function refreshList() {
     fetch('/gallery/list').then(r => r.json()).then(data => {
+        // Skip rebuild if file list hasn't changed
+        if (JSON.stringify(data.files) === JSON.stringify(files)) return;
+
         files = data.files;
         fileSelect.innerHTML = '';
         thumbStrip.innerHTML = '';
@@ -210,6 +213,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 refreshList();
+setInterval(refreshList, 500);
 </script>
 </body>
 </html>
