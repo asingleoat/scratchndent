@@ -72,6 +72,8 @@ PARAM_DEFAULTS = {
 
 # Comments for each parameter, written to TOML for self-documentation
 PARAM_COMMENTS = {
+    "stock": "Active film stock name — must match a [stocks.<name>] section below",
+    "preview_size": "Max preview dimension in pixels (default 2400)",
     "ir_threshold": "Defect detection sensitivity (lower = more aggressive, default 0.25)",
     "ir_hair_sensitivity": "Meijering line filter threshold for hairs/scratches (lower = more sensitive, default 0.10)",
     "ir_min_area": "Minimum defect size in pixels to keep (default 3)",
@@ -85,10 +87,10 @@ PARAM_COMMENTS = {
     "render_percentile_lo": "Low percentile for display range normalization (default 0.5)",
     "render_percentile_hi": "High percentile for display range normalization (default 99.5)",
     "exposure_compensation": "Density-domain exposure shift: positive = brighter output (default 0.0)",
-    "preview_size": "Max preview dimension in pixels (default 2400)",
     "clahe_clip": "CLAHE clip limit for preview contrast enhancement (default 2.0)",
     "dmin": "Film base density [R, G, B] — set via rebate selection in the UI",
     "ir_clean": "Enable IR dust/scratch removal (true/false)",
+    "invert": "Enable film negative inversion (true/false)",
     "aspect": "Last used aspect ratio for frame selection",
 }
 
@@ -109,25 +111,63 @@ PARAM_SECTIONS = {
     "exposure_compensation": "inversion",
 }
 
+# Built-in film stock definitions. Each maps to polynomial coefficients (10x3).
+# Basis: [R, G, B, R², G², B², RG, RB, GB, 1] → [R_out, G_out, B_out]
+from scratchndent.film_calibration import default_kodak_gold_coeffs, default_kodak_portra_coeffs
+
+BUILTIN_STOCKS = {
+    "kodak_gold": {
+        "description": "Kodak Gold 200 on Epson V600",
+        "coeffs": default_kodak_gold_coeffs().tolist(),
+    },
+    "kodak_portra": {
+        "description": "Kodak Portra 400 on Epson V600",
+        "coeffs": default_kodak_portra_coeffs().tolist(),
+    },
+}
+
+
+def get_available_stocks() -> dict[str, dict]:
+    """Get all available film stocks: built-in + config-defined."""
+    stocks = dict(BUILTIN_STOCKS)
+    cfg = load_config()
+    # Config stocks override built-ins
+    if "_stocks" in cfg:
+        stocks.update(cfg["_stocks"])
+    return stocks
+
+
+def get_stock_coeffs(name: str) -> np.ndarray:
+    """Get polynomial coefficients for a film stock by name."""
+    stocks = get_available_stocks()
+    if name in stocks:
+        return np.array(stocks[name]["coeffs"], dtype=np.float64)
+    raise ValueError(f"Unknown film stock '{name}'. "
+                     f"Available: {list(stocks.keys())}")
+
 
 def load_config() -> dict:
     """Load persisted settings from TOML config file.
 
-    Returns a flat dict — TOML sections are flattened by prefixing
-    section keys where needed, but top-level keys are kept as-is.
+    Returns a flat dict with parameter sections flattened.
+    Stock definitions are stored under the special key "_stocks".
     """
     if CONFIG_FILE.exists():
         try:
             import tomllib
             with open(CONFIG_FILE, "rb") as f:
                 raw = tomllib.load(f)
-            # Flatten sections into a flat dict
             flat = {}
+            stocks = {}
             for k, v in raw.items():
-                if isinstance(v, dict):
+                if k == "stocks" and isinstance(v, dict):
+                    stocks = v
+                elif isinstance(v, dict):
                     flat.update(v)
                 else:
                     flat[k] = v
+            if stocks:
+                flat["_stocks"] = stocks
             return flat
         except (Exception,):
             pass
@@ -151,12 +191,13 @@ def save_config(updates: dict) -> None:
     cfg = load_config()
     cfg.update(updates)
 
-    # Build a complete config with all known keys.
-    # Keys present in cfg are written active; defaults are commented out.
+    # Separate stock definitions from flat params
+    stocks = cfg.pop("_stocks", {})
+
     lines = ["# scratchndent configuration", "# Edit values below or uncomment to override defaults", ""]
 
-    # Collect all known top-level keys (not in a section)
-    top_keys = ["dmin", "ir_clean", "aspect"]
+    # Top-level keys
+    top_keys = ["stock", "preview_size", "dmin", "ir_clean", "invert", "aspect"]
     for k in top_keys:
         comment = PARAM_COMMENTS.get(k)
         if comment:
@@ -167,7 +208,7 @@ def save_config(updates: dict) -> None:
             lines.append(f"# {k} = {_format_toml_value(PARAM_DEFAULTS[k])}")
         lines.append("")
 
-    # Write sections with all params — active if in cfg, commented if default
+    # Parameter sections
     for section_name in ["dust_removal", "inversion", "render"]:
         section_keys = [k for k, s in PARAM_SECTIONS.items() if s == section_name]
         if not section_keys:
@@ -183,6 +224,28 @@ def save_config(updates: dict) -> None:
                 lines.append(f"# {k} = {_format_toml_value(PARAM_DEFAULTS[k])}")
         lines.append("")
 
+    # Film stock definitions
+    # Write all available stocks (built-in + custom)
+    all_stocks = dict(BUILTIN_STOCKS)
+    all_stocks.update(stocks)
+    lines.append("# Film stock profiles. Each defines polynomial coefficients for the")
+    lines.append("# density-to-scene transform. Basis: [R, G, B, R2, G2, B2, RG, RB, GB, 1] -> [R, G, B]")
+    lines.append("# Rows are the 10 basis terms, columns are R/G/B output channels.")
+    lines.append("# Edit coefficients to tune color response for your scanner+stock combination.")
+    lines.append("")
+    for name, stock_def in all_stocks.items():
+        lines.append(f"[stocks.{name}]")
+        if "description" in stock_def:
+            lines.append(f'description = "{stock_def["description"]}"')
+        coeffs = stock_def["coeffs"]
+        basis_labels = ["R", "G", "B", "R2", "G2", "B2", "RG", "RB", "GB", "bias"]
+        lines.append("coeffs = [")
+        for i, row in enumerate(coeffs):
+            row_str = ", ".join(f"{v:8.4f}" for v in row)
+            lines.append(f"    [{row_str}],  # {basis_labels[i]}")
+        lines.append("]")
+        lines.append("")
+
     CONFIG_FILE.write_text("\n".join(lines))
 
 
@@ -192,6 +255,18 @@ def get_param(name: str) -> float | int:
     if name in cfg:
         return type(PARAM_DEFAULTS[name])(cfg[name])
     return PARAM_DEFAULTS[name]
+
+
+def get_active_stock() -> str | None:
+    """Get the active film stock name from config, or None if not set."""
+    cfg = load_config()
+    return cfg.get("stock")
+
+
+def get_preview_size() -> int:
+    """Get the preview size from config."""
+    cfg = load_config()
+    return int(cfg.get("preview_size", PARAM_DEFAULTS["preview_size"]))
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +285,7 @@ FULL_WIDTH: int = 0                       # full-res dimensions (from raw load)
 FULL_HEIGHT: int = 0
 IMAGE_LIST: list[str] = []               # all image paths in folder
 IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
-FILM_STOCK: str | None = None              # film stock for inversion (None = no inversion)
-FILM_PROFILE: str | None = None            # path to calibration profile (overrides stock)
 IR_CLEAN: bool = True                     # auto-detect by default
-PREVIEW_SIZE: int = 2400
 LOADING: bool = False                     # True while switching images
 HAS_IR: bool = False                      # whether current image has IR channel
 PROGRESS: str = ""                        # current export/processing status for GUI
@@ -252,11 +324,13 @@ def make_rebate_mask(h: int, w: int) -> np.ndarray | None:
 
 def apply_inversion(img: np.ndarray) -> np.ndarray:
     """Film inversion pipeline. Input: uint16, output: uint16."""
+    stock = get_active_stock()
+    coeffs = get_stock_coeffs(stock) if stock else None
     scene_linear = invert_negative(
         img,
         dmin=DMIN,
-        stock=FILM_STOCK or "kodak_gold",
-        profile_path=FILM_PROFILE,
+        stock=stock or "kodak_gold",
+        coeffs=coeffs,
         exposure_compensation=get_param("exposure_compensation"),
     )
     return render_to_display(
@@ -293,7 +367,7 @@ def ensure_loaded() -> None:
 
     # Compute Dmin if we don't already have one from a previous image.
     # Dmin persists across the roll — set once from a good rebate area.
-    if FILM_STOCK and DMIN is None:
+    if get_active_stock() and DMIN is None:
         if REBATE_RECT and _rebate_in_bounds(rgb.shape, REBATE_RECT):
             r = REBATE_RECT
             set_progress("Computing Dmin from rebate selection...")
@@ -370,7 +444,7 @@ def switch_to_image(idx: int) -> None:
     print(f"  Image: {w}x{h}, {rgb.dtype}")
 
     # Downscale for preview
-    preview_scale = min(PREVIEW_SIZE / max(h, w), 1.0)
+    preview_scale = min(get_preview_size() / max(h, w), 1.0)
     if preview_scale < 1.0:
         pw, ph = int(w * preview_scale), int(h * preview_scale)
         small_rgb = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
@@ -519,7 +593,15 @@ class Handler(BaseHTTPRequestHandler):
                           json.dumps({"status": PROGRESS}).encode())
         elif parsed.path == "/settings":
             cfg = load_config()
+            cfg.pop("_stocks", None)  # don't send raw stock defs in flat settings
             self._respond(200, "application/json", json.dumps(cfg).encode())
+        elif parsed.path == "/stocks":
+            stocks = get_available_stocks()
+            data = {
+                "active": get_active_stock(),
+                "stocks": {k: v.get("description", k) for k, v in stocks.items()},
+            }
+            self._respond(200, "application/json", json.dumps(data).encode())
         elif parsed.path == "/images":
             rescan_images()
             data = {
@@ -583,7 +665,7 @@ class Handler(BaseHTTPRequestHandler):
             # Compute Dmin from the rebate region. Use cached full image
             # if available, otherwise read just the region from disk.
             global DMIN
-            if FILM_STOCK:
+            if get_active_stock():
                 r = REBATE_RECT
                 if FULL_IMG is not None:
                     rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
@@ -766,7 +848,7 @@ def handle_export(body: dict) -> dict:
 
         meta = {
             "source": Path(INPUT_PATH).name,
-            "stock": FILM_STOCK if invert else None,
+            "stock": get_active_stock() if invert else None,
             "contrast": get_param("render_contrast") if invert else None,
             "ir_clean": ir_clean and aligned_ir is not None,
             "invert": invert,
@@ -781,7 +863,7 @@ def handle_export(body: dict) -> dict:
     exported = [None] * n_rects
     all_timings = [None] * n_rects
 
-    film_stock = FILM_STOCK if invert else None
+    film_stock = get_active_stock() if invert else None
 
     if n_rects == 1:
         # Single frame — no pool overhead
@@ -860,8 +942,8 @@ def find_images(path: Path) -> list[str]:
 
 
 def main():
-    global OUTPUT_DIR, INPUT_DIR, IMAGE_LIST, FILM_STOCK, FILM_PROFILE
-    global IR_CLEAN, PREVIEW_SIZE, DMIN
+    global OUTPUT_DIR, INPUT_DIR, IMAGE_LIST
+    global IR_CLEAN, DMIN
 
     parser = argparse.ArgumentParser(
         description="Browser-based frame extraction from scanned film strips",
@@ -881,24 +963,12 @@ def main():
         help="Directory for exported frames (default: frames/)",
     )
     parser.add_argument(
-        "--preview-size", type=int, default=2400,
-        help="Max dimension of browser preview in pixels (default: 2400)",
-    )
-    parser.add_argument(
         "--stock", type=str, default=None,
-        help="Film stock for inversion (kodak_gold, kodak_portra)",
-    )
-    parser.add_argument(
-        "--profile", type=str, default=None,
-        help="Path to calibration profile JSON (overrides --stock)",
-    )
-    parser.add_argument(
-        "--contrast", type=float, default=1.2,
-        help="Rendering contrast S-curve (default: 1.2, range 1.0-2.0)",
+        help="Film stock for inversion (saves to config: kodak_gold, kodak_portra)",
     )
     parser.add_argument(
         "--no-ir-clean", action="store_true",
-        help="Disable automatic IR dust/scratch removal",
+        help="Disable automatic IR dust/scratch removal (saves to config)",
     )
     args = parser.parse_args()
 
@@ -907,19 +977,22 @@ def main():
         sys.exit(1)
 
     OUTPUT_DIR = Path(args.output_dir)
-    FILM_STOCK = args.stock
-    FILM_PROFILE = args.profile
-    # Save CLI contrast override to config if explicitly set
-    if args.contrast != 1.2:
-        save_config({"render_contrast": args.contrast})
+
+    # CLI overrides get saved to config
+    cli_overrides = {}
+    if args.stock is not None:
+        cli_overrides["stock"] = args.stock
+    if args.no_ir_clean:
+        cli_overrides["ir_clean"] = False
+    if cli_overrides:
+        save_config(cli_overrides)
 
     # Load persisted settings from config file
     cfg = load_config()
-    if cfg.get("dmin") and FILM_STOCK:
+    if cfg.get("dmin") and get_active_stock():
         DMIN = np.array(cfg["dmin"], dtype=np.float64)
         print(f"Loaded Dmin from config: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
-    IR_CLEAN = cfg.get("ir_clean", not args.no_ir_clean)
-    PREVIEW_SIZE = args.preview_size
+    IR_CLEAN = cfg.get("ir_clean", True)
 
     input_path = Path(args.input)
     INPUT_DIR = input_path.parent if input_path.is_file() else input_path

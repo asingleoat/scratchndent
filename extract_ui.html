@@ -131,6 +131,16 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <div style="padding:4px 0 8px;font-size:13px;color:#888;">Selections</div>
     <div id="sel-list"></div>
 
+    <details class="settings-group" id="settings-stock" open>
+        <summary>Film Stock</summary>
+        <div class="param-row" title="Select the film stock profile for negative inversion. Defines the color transform coefficients.">
+            <label>Stock</label>
+            <select id="stock-select" style="width:100%;font-size:11px;background:#333;color:#eee;border:1px solid #555;border-radius:3px;padding:3px">
+                <option value="">(none — no inversion)</option>
+            </select>
+        </div>
+    </details>
+
     <details class="settings-group" id="settings-render">
         <summary>Rendering</summary>
         <div class="param-row" title="S-curve contrast strength. 1.0 = no contrast adjustment (linear), higher values darken shadows and brighten highlights for more punch">
@@ -309,6 +319,34 @@ function fmtVal(v, step) {
     const decimals = step && step.includes('.') ? step.split('.')[1].length : 2;
     return v.toFixed(decimals);
 }
+
+// Populate film stock dropdown
+const stockSelect = document.getElementById('stock-select');
+fetch('/stocks').then(r => r.json()).then(data => {
+    stockSelect.innerHTML = '<option value="">(none — no inversion)</option>';
+    for (const [name, desc] of Object.entries(data.stocks)) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = `${name} — ${desc}`;
+        stockSelect.appendChild(opt);
+    }
+    if (data.active) stockSelect.value = data.active;
+});
+stockSelect.addEventListener('change', () => {
+    const stock = stockSelect.value || null;
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stock }),
+    });
+    // Also update the Invert checkbox to match
+    document.getElementById('chk-invert').checked = !!stock;
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invert: !!stock }),
+    });
+});
 
 function initParamSliders(cfg) {
     document.querySelectorAll('[data-param]').forEach(input => {

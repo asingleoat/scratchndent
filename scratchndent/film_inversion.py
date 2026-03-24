@@ -61,6 +61,7 @@ def invert_negative(
     raw_rgb: np.ndarray,
     *,
     dmin: np.ndarray | None = None,
+    coeffs: np.ndarray | None = None,
     stock: str = "kodak_gold",
     profile_path: str | None = None,
     dark_rgb: np.ndarray | None = None,
@@ -76,36 +77,34 @@ def invert_negative(
         Raw linear scan from SilverFast / scanner.
     dmin : (3,) float64, optional
         Pre-computed Dmin values (from compute_dmin on the full strip).
-        If provided, rebate_mask is ignored for Dmin estimation.
+    coeffs : (10, 3) float64, optional
+        Polynomial coefficients. If provided, overrides stock/profile lookup.
     stock : str
-        Film stock name for default coefficients ("kodak_gold", "kodak_portra").
+        Film stock name for built-in defaults. Only used if coeffs and
+        profile_path are both None.
     profile_path : str, optional
-        Path to a JSON calibration profile. Overrides stock defaults.
-    dark_rgb : (3,), optional
-        Scanner dark level per channel. Defaults to 0.
-    light_rgb : (3,), optional
-        Scanner light field per channel. Defaults to 65535 for uint16.
-    rebate_mask : HxW bool, optional
-        Mask of unexposed rebate pixels for Dmin estimation. Only used
-        if dmin is not provided.
+        Path to a JSON calibration profile. Only used if coeffs is None.
+    dark_rgb, light_rgb, rebate_mask :
+        Passed to measurement model (see normalize_transmittance, estimate_dmin).
     exposure_compensation : float
         Density-domain exposure shift (positive = brighter output).
 
     Returns
     -------
     scene_linear : HxWx3 float64
-        Scene-linear RGB values, suitable for tone mapping / display rendering.
     """
-    # Load calibration coefficients
-    if profile_path is not None:
+    # Resolve calibration coefficients
+    if coeffs is not None:
+        print(f"  Using provided coefficients")
+    elif profile_path is not None:
         coeffs, _meta = load_profile(profile_path)
         print(f"  Using calibration profile: {profile_path}")
     elif stock in STOCK_DEFAULTS:
         coeffs = STOCK_DEFAULTS[stock]()
-        print(f"  Using default profile for {stock}")
+        print(f"  Using built-in profile for {stock}")
     else:
-        raise ValueError(f"Unknown film stock '{stock}' and no profile_path given. "
-                         f"Available stocks: {list(STOCK_DEFAULTS.keys())}")
+        raise ValueError(f"Unknown film stock '{stock}' and no coefficients given. "
+                         f"Available built-in stocks: {list(STOCK_DEFAULTS.keys())}")
 
     # Stage 1: Measurement model
     print("  Converting to transmittance...")
