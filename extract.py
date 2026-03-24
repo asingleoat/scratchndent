@@ -948,27 +948,22 @@ def main():
     parser = argparse.ArgumentParser(
         description="Browser-based frame extraction from scanned film strips",
         epilog="Examples:\n"
-               "  python extract.py scan.tiff              # single file\n"
-               "  python extract.py /path/to/scans/        # whole directory\n"
-               "  python extract.py . --stock kodak_gold   # current dir + inversion",
+               "  python extract.py scan.tiff           # single file\n"
+               "  python extract.py /path/to/scans/     # whole directory\n"
+               "\n"
+               "Film stock, IR cleaning, contrast, and other settings are\n"
+               "configured in the GUI or scratchndent_config.toml.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "input", nargs="?", default=None,
         help="Input TIFF file or directory of TIFFs to process",
     )
-    parser.add_argument("--port", type=int, default=8888)
+    parser.add_argument("--port", type=int, default=8888,
+                        help="Server port (default: 8888)")
     parser.add_argument(
         "--output-dir", type=str, default="frames",
         help="Directory for exported frames (default: frames/)",
-    )
-    parser.add_argument(
-        "--stock", type=str, default=None,
-        help="Film stock for inversion (saves to config: kodak_gold, kodak_portra)",
-    )
-    parser.add_argument(
-        "--no-ir-clean", action="store_true",
-        help="Disable automatic IR dust/scratch removal (saves to config)",
     )
     args = parser.parse_args()
 
@@ -977,15 +972,6 @@ def main():
         sys.exit(1)
 
     OUTPUT_DIR = Path(args.output_dir)
-
-    # CLI overrides get saved to config
-    cli_overrides = {}
-    if args.stock is not None:
-        cli_overrides["stock"] = args.stock
-    if args.no_ir_clean:
-        cli_overrides["ir_clean"] = False
-    if cli_overrides:
-        save_config(cli_overrides)
 
     # Load persisted settings from config file
     cfg = load_config()
