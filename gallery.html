@@ -35,11 +35,10 @@ body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; }
 .thumb.active { border-color: #2d6; }
 .thumb:hover { border-color: #888; }
 #main-view {
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    overflow: hidden; padding: 16px;
+    flex: 1; position: relative; overflow: hidden;
 }
 #main-view img {
-    max-width: 100%; max-height: 100%; object-fit: contain;
+    position: absolute; transform-origin: 0 0; cursor: grab;
 }
 #status {
     position: fixed; bottom: 0; left: 0; right: 0; height: 24px;
@@ -75,6 +74,25 @@ const statusEl = document.getElementById('status');
 
 let files = [];
 let currentIdx = -1;
+let viewImg = null;  // current <img> element
+let scale = 1, offsetX = 0, offsetY = 0;
+let panning = false, panStart = null;
+
+function fitImage() {
+    if (!viewImg || !viewImg.naturalWidth) return;
+    const vw = mainView.clientWidth, vh = mainView.clientHeight;
+    const iw = viewImg.naturalWidth, ih = viewImg.naturalHeight;
+    scale = Math.min(vw / iw, vh / ih) * 0.95;
+    offsetX = (vw - iw * scale) / 2;
+    offsetY = (vh - ih * scale) / 2;
+    applyTransform();
+}
+
+function applyTransform() {
+    if (viewImg) {
+        viewImg.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+    }
+}
 
 function refreshList() {
     fetch('/gallery/list').then(r => r.json()).then(data => {
@@ -86,17 +104,16 @@ function refreshList() {
             mainView.innerHTML = '<div id="empty-msg">No exported frames yet</div>';
             statusEl.textContent = 'No exports found';
             currentIdx = -1;
+            viewImg = null;
             return;
         }
 
         files.forEach((name, i) => {
-            // Dropdown
             const opt = document.createElement('option');
             opt.value = i;
             opt.textContent = `${i + 1}/${files.length}: ${name}`;
             fileSelect.appendChild(opt);
 
-            // Thumbnail
             const img = document.createElement('img');
             img.className = 'thumb';
             img.src = `/gallery/thumb/${encodeURIComponent(name)}`;
@@ -105,7 +122,6 @@ function refreshList() {
             thumbStrip.appendChild(img);
         });
 
-        // Show first image or keep current
         if (currentIdx < 0 || currentIdx >= files.length) {
             showImage(0);
         } else {
@@ -120,16 +136,63 @@ function showImage(idx) {
     currentIdx = idx;
     fileSelect.value = idx;
 
-    // Update thumbnail highlights
     const thumbs = thumbStrip.querySelectorAll('.thumb');
     thumbs.forEach((t, i) => t.classList.toggle('active', i === idx));
-    // Scroll active thumb into view
     if (thumbs[idx]) thumbs[idx].scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
 
     const name = files[idx];
-    mainView.innerHTML = `<img src="/gallery/full/${encodeURIComponent(name)}">`;
+    mainView.innerHTML = '';
+    viewImg = document.createElement('img');
+    viewImg.src = `/gallery/full/${encodeURIComponent(name)}`;
+    viewImg.draggable = false;
+    viewImg.onload = fitImage;
+    mainView.appendChild(viewImg);
     statusEl.textContent = `${idx + 1}/${files.length}: ${name}`;
 }
+
+// Scroll to zoom
+mainView.addEventListener('wheel', (e) => {
+    if (!viewImg) return;
+    e.preventDefault();
+    const rect = mainView.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    offsetX = mx - (mx - offsetX) * factor;
+    offsetY = my - (my - offsetY) * factor;
+    scale *= factor;
+    applyTransform();
+}, { passive: false });
+
+// Middle mouse pan
+mainView.addEventListener('mousedown', (e) => {
+    if (e.button === 1 || (e.button === 0 && scale > 1.01)) {
+        panning = true;
+        panStart = { x: e.clientX - offsetX, y: e.clientY - offsetY };
+        if (viewImg) viewImg.style.cursor = 'grabbing';
+        e.preventDefault();
+    }
+});
+window.addEventListener('mousemove', (e) => {
+    if (panning && panStart) {
+        offsetX = e.clientX - panStart.x;
+        offsetY = e.clientY - panStart.y;
+        applyTransform();
+    }
+});
+window.addEventListener('mouseup', (e) => {
+    if (panning) {
+        panning = false;
+        panStart = null;
+        if (viewImg) viewImg.style.cursor = 'grab';
+    }
+});
+
+// Double-click to reset zoom
+mainView.addEventListener('dblclick', () => fitImage());
+
+// Resize
+window.addEventListener('resize', fitImage);
 
 fileSelect.addEventListener('change', () => showImage(parseInt(fileSelect.value)));
 fileSelect.addEventListener('focus', refreshList);
