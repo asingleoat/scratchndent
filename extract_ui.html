@@ -185,7 +185,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
         <div class="param-row" title="How far below the local background a pixel must be to count as a defect. Lower values detect fainter dust but may flag film grain. Higher values only catch obvious defects">
             <label>Detection threshold</label>
             <div class="param-ctrl">
-                <input type="range" data-param="ir_threshold" min="0.10" max="0.50" step="0.01">
+                <input type="range" data-param="ir_threshold" min="0.02" max="0.50" step="0.01">
                 <span class="param-val"></span>
             </div>
         </div>
@@ -307,7 +307,7 @@ function updateDminDisplay(dmin) {
 }
 // Parameter defaults (must match PARAM_DEFAULTS in extract.py)
 const PARAM_DEFAULTS = {
-    ir_threshold: 0.25, ir_hair_sensitivity: 0.10, ir_min_area: 3,
+    ir_threshold: 0.10, ir_hair_sensitivity: 0.10, ir_min_area: 3,
     ir_dilate_radius: 4, ir_close_radius: 6, ir_max_coverage: 0.03,
     inpaint_padding: 16, render_contrast: 1.2, render_curve_k: 5.0,
     render_percentile_lo: 0.5, render_percentile_hi: 99.5,

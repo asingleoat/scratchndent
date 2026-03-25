@@ -118,7 +118,7 @@ def align_ir(rgb: np.ndarray, ir: np.ndarray) -> np.ndarray:
 def make_defect_mask(
     ir: np.ndarray,
     rgb: np.ndarray | None = None,
-    threshold: float = 0.25,
+    threshold: float = 0.10,
     hair_sensitivity: float = 0.10,
     min_area: int = 3,
     dilate_radius: int = 4,

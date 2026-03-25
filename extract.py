@@ -49,7 +49,7 @@ REFERENCE_DPI = 800
 # Pixel-based params are defined at REFERENCE_DPI.
 PARAM_DEFAULTS = {
     # IR dust/scratch detection (pixel params at 800 DPI reference)
-    "ir_threshold": 0.25,
+    "ir_threshold": 0.10,
     "ir_hair_sensitivity": 0.10,
     "ir_min_area": 3,              # pixels at 800 DPI
     "ir_dilate_radius": 4,         # pixels at 800 DPI
