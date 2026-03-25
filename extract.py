@@ -41,20 +41,24 @@ from scratchndent.film_render import render_to_display
 
 CONFIG_FILE = Path("scratchndent_config.toml")
 
+# Reference DPI for pixel-based parameters. All pixel params are defined
+# at this resolution and scaled automatically for the actual scan DPI.
+REFERENCE_DPI = 800
+
 # Default algorithm parameters — overridden by config file values.
-# Grouped by section for the TOML file.
+# Pixel-based params are defined at REFERENCE_DPI.
 PARAM_DEFAULTS = {
-    # IR dust/scratch detection
+    # IR dust/scratch detection (pixel params at 800 DPI reference)
     "ir_threshold": 0.25,
     "ir_hair_sensitivity": 0.10,
-    "ir_min_area": 3,
-    "ir_dilate_radius": 4,
-    "ir_close_radius": 6,
-    "ir_blur_size": 301,
+    "ir_min_area": 3,              # pixels at 800 DPI
+    "ir_dilate_radius": 4,         # pixels at 800 DPI
+    "ir_close_radius": 6,          # pixels at 800 DPI
+    "ir_blur_size": 301,           # pixels at 800 DPI
     "ir_max_coverage": 0.03,
 
     # Inpainting
-    "inpaint_padding": 16,
+    "inpaint_padding": 16,         # pixels at 800 DPI
 
     # Film rendering
     "render_contrast": 1.2,
@@ -70,18 +74,29 @@ PARAM_DEFAULTS = {
     "clahe_clip": 2.0,
 }
 
+# Parameters that scale with DPI (pixel-based)
+DPI_SCALED_PARAMS = {
+    "ir_min_area",       # scales as area (DPI ratio squared)
+    "ir_dilate_radius",  # scales linearly
+    "ir_close_radius",
+    "ir_blur_size",
+    "inpaint_padding",
+}
+# Area-based params scale quadratically
+DPI_AREA_PARAMS = {"ir_min_area"}
+
 # Comments for each parameter, written to TOML for self-documentation
 PARAM_COMMENTS = {
     "stock": "Active film stock name — must match a [stocks.<name>] section below",
     "preview_size": "Max preview dimension in pixels (default 2400)",
     "ir_threshold": "Defect detection sensitivity (lower = more aggressive, default 0.25)",
     "ir_hair_sensitivity": "Meijering line filter threshold for hairs/scratches (lower = more sensitive, default 0.10)",
-    "ir_min_area": "Minimum defect size in pixels to keep (default 3)",
-    "ir_dilate_radius": "Mask dilation radius — expands detected defects (default 4)",
-    "ir_close_radius": "Morphological close radius — fills gaps in large defects (default 6)",
-    "ir_blur_size": "Background estimation blur kernel size, must be odd (default 301)",
+    "ir_min_area": "Minimum defect size in pixels at 800 DPI — auto-scaled for scan resolution (default 3)",
+    "ir_dilate_radius": "Mask dilation in pixels at 800 DPI — auto-scaled for scan resolution (default 4)",
+    "ir_close_radius": "Morphological close in pixels at 800 DPI — auto-scaled for scan resolution (default 6)",
+    "ir_blur_size": "Background blur kernel in pixels at 800 DPI — auto-scaled for scan resolution (default 301)",
     "ir_max_coverage": "Sanity cap: max fraction of image flagged as defects before giving up (default 0.03 = 3%)",
-    "inpaint_padding": "Context padding around each defect for inpainting (default 16)",
+    "inpaint_padding": "Context padding in pixels at 800 DPI — auto-scaled for scan resolution (default 16)",
     "render_contrast": "S-curve contrast strength: 1.0 = linear, 1.5 = moderate, 2.0 = punchy (default 1.2)",
     "render_curve_k": "S-curve steepness multiplier (default 5.0)",
     "render_percentile_lo": "Low percentile for display range normalization (default 0.5)",
@@ -249,12 +264,56 @@ def save_config(updates: dict) -> None:
     CONFIG_FILE.write_text("\n".join(lines))
 
 
+def read_tiff_dpi(path: str) -> int | None:
+    """Read DPI from TIFF XResolution tag. Returns None if not available."""
+    try:
+        with tifffile.TiffFile(path) as tif:
+            page = tif.pages[0]
+            res_tag = page.tags.get(282)  # XResolution
+            unit_tag = page.tags.get(296)  # ResolutionUnit
+            if res_tag is None:
+                return None
+            # XResolution is a rational (numerator, denominator)
+            val = res_tag.value
+            if isinstance(val, tuple):
+                dpi = val[0] / val[1] if val[1] != 0 else val[0]
+            else:
+                dpi = float(val)
+            # ResolutionUnit: 2=inches, 3=centimeters
+            if unit_tag and unit_tag.value == 3:
+                dpi *= 2.54  # convert from dots/cm to DPI
+            return int(round(dpi))
+    except Exception:
+        return None
+
+
+CURRENT_DPI: int | None = None  # set when an image is loaded
+
+
+def get_dpi_scale() -> float:
+    """Get the scale factor from reference DPI to current scan DPI."""
+    if CURRENT_DPI and CURRENT_DPI > 0:
+        return CURRENT_DPI / REFERENCE_DPI
+    return 1.0
+
+
 def get_param(name: str) -> float | int:
-    """Get a parameter value: config file overrides, then defaults."""
+    """Get a parameter value, scaled for DPI if applicable."""
     cfg = load_config()
-    if name in cfg:
-        return type(PARAM_DEFAULTS[name])(cfg[name])
-    return PARAM_DEFAULTS[name]
+    raw = cfg[name] if name in cfg else PARAM_DEFAULTS[name]
+
+    if name in DPI_SCALED_PARAMS:
+        scale = get_dpi_scale()
+        if name in DPI_AREA_PARAMS:
+            raw = raw * scale * scale  # area scales quadratically
+        else:
+            raw = raw * scale
+        # Blur size must be odd
+        if name == "ir_blur_size":
+            raw = int(raw) | 1  # ensure odd
+            return raw
+
+    return type(PARAM_DEFAULTS[name])(raw)
 
 
 def get_active_stock() -> str | None:
@@ -352,9 +411,13 @@ def ensure_loaded() -> None:
     Dmin is computed from the full strip (using rebate if available)
     so per-crop inversion has a correct film base reference.
     """
-    global FULL_IMG, FULL_IR, FULL_IMG_READY, DMIN
+    global FULL_IMG, FULL_IR, FULL_IMG_READY, DMIN, CURRENT_DPI
     if FULL_IMG_READY:
         return
+
+    # Ensure DPI is set for parameter scaling
+    if CURRENT_DPI is None:
+        CURRENT_DPI = read_tiff_dpi(INPUT_PATH)
 
     set_progress("Loading full-resolution image...")
     rgb, ir = load_image(INPUT_PATH)
@@ -426,7 +489,7 @@ def ir_clean_region(
 def switch_to_image(idx: int) -> None:
     """Load image, generate preview at reduced resolution for speed."""
     global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
-    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR
+    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, CURRENT_DPI
     LOADING = True
     FULL_IMG = None
     FULL_IR = None
@@ -436,12 +499,15 @@ def switch_to_image(idx: int) -> None:
     IMAGE_IDX = idx
     INPUT_PATH = IMAGE_LIST[idx]
 
+    # Read DPI from file metadata for parameter scaling
+    CURRENT_DPI = read_tiff_dpi(INPUT_PATH)
     print(f"Loading {INPUT_PATH} ({idx + 1}/{len(IMAGE_LIST)})...")
     rgb, ir = load_image(INPUT_PATH)
     h, w = rgb.shape[:2]
     FULL_WIDTH, FULL_HEIGHT = w, h
     HAS_IR = ir is not None
-    print(f"  Image: {w}x{h}, {rgb.dtype}")
+    dpi_str = f", {CURRENT_DPI} DPI (scale {get_dpi_scale():.1f}x)" if CURRENT_DPI else ""
+    print(f"  Image: {w}x{h}, {rgb.dtype}{dpi_str}")
 
     # Downscale for preview
     preview_scale = min(get_preview_size() / max(h, w), 1.0)
@@ -586,6 +652,8 @@ class Handler(BaseHTTPRequestHandler):
                 "image_count": len(IMAGE_LIST),
                 "loading": LOADING,
                 "has_dmin": DMIN is not None,
+                "dpi": CURRENT_DPI,
+                "dpi_scale": round(get_dpi_scale(), 2),
             }
             self._respond(200, "application/json", json.dumps(info).encode())
         elif parsed.path == "/progress":
