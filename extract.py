@@ -858,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                                   json.dumps({"ok": True,
                                               "frames": result["frames"],
                                               "aspect": result["aspect"],
-                                              "debug": result.get("debug")}).encode())
+                                              }).encode())
                 else:
                     self._respond(400, "application/json",
                                   json.dumps({"error": "No image loaded"}).encode())
@@ -866,19 +866,6 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"  Auto-detect error: {e}")
                 self._respond(500, "application/json",
                               json.dumps({"error": str(e)}).encode())
-        elif self.path == "/debug/selections":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            sels = body.get("selections", [])
-            print(f"\n  === Current selections ({len(sels)} frames) ===")
-            for i, s in enumerate(sels):
-                print(f"  Frame {i+1}: x={s['x']:.1f} y={s['y']:.1f} "
-                      f"w={s['w']:.1f} h={s['h']:.1f} "
-                      f"angle={s.get('angle',0):.4f}")
-            print(f"  (preview scale: {PREVIEW_SCALE:.4f})")
-            print()
-            self._respond(200, "application/json",
-                          json.dumps({"ok": True}).encode())
         elif self.path == "/scan/trash":
             self._scan_trash()
         elif self.path == "/scan/delete":

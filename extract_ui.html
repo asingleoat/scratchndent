@@ -119,7 +119,6 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
         <option value="6x9">6x9</option>
     </select>
     <button id="btn-auto" title="Automatically detect frame positions based on film format">Auto Detect</button>
-    <button id="btn-dump" title="Print current selections to server console">Dump</button>
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label title="Export IR cleaned negative (dust/scratch removal only)"><input type="checkbox" id="chk-ir-neg"> IR cleaned</label>
@@ -281,7 +280,6 @@ let mode = 'idle'; // idle, drawing, moving, resizing, rotating, drawing_rebate
 let drawStart = null;
 let dragInfo = null;
 let rebateRect = null; // {x, y, w, h} in preview coords, or null
-let autoDebugData = null; // debug profiles from auto-detect
 
 const HANDLE_SIZE = 8;
 const ROT_HANDLE_DIST = 30;
@@ -741,55 +739,6 @@ function render() {
         ctx.fillText('rebate (Dmin)', rx + 4, ry + 14);
     }
 
-    // Draw auto-detect debug profiles
-    if (autoDebugData) {
-        const d = autoDebugData;
-        const ws = d.work_scale;
-        const profW = 40; // width of profile strip in screen pixels
-        if (d.is_vertical) {
-            // Strip profiles run along y — draw as vertical strips beside the image
-            const drawProf = (prof, screenX, color) => {
-                ctx.beginPath();
-                for (let i = 0; i < prof.length; i++) {
-                    const imgY = i / ws; // profile index → preview-image y
-                    const [, sy] = imgToScreen(0, imgY);
-                    const barW = prof[i] * profW;
-                    if (i === 0) ctx.moveTo(screenX + barW, sy);
-                    else ctx.lineTo(screenX + barW, sy);
-                }
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 1.5;
-                ctx.stroke();
-                // Draw zero line
-                ctx.beginPath();
-                ctx.moveTo(screenX, imgToScreen(0, 0)[1]);
-                ctx.lineTo(screenX, imgToScreen(0, imgH)[1]);
-                ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-                ctx.lineWidth = 1;
-                ctx.stroke();
-            };
-            drawProf(d.profile_a, 10, 'rgba(255,100,100,0.8)');
-            drawProf(d.profile_b, 10 + profW + 5, 'rgba(100,100,255,0.8)');
-        } else {
-            // Strip profiles run along x — draw as horizontal strips above/below
-            const drawProf = (prof, screenY, color) => {
-                ctx.beginPath();
-                for (let i = 0; i < prof.length; i++) {
-                    const imgX = i / ws;
-                    const [sx] = imgToScreen(imgX, 0);
-                    const barH = prof[i] * profW;
-                    if (i === 0) ctx.moveTo(sx, screenY - barH);
-                    else ctx.lineTo(sx, screenY - barH);
-                }
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 1.5;
-                ctx.stroke();
-            };
-            drawProf(d.profile_a, canvas.height - 10, 'rgba(255,100,100,0.8)');
-            drawProf(d.profile_b, canvas.height - 10 - profW - 5, 'rgba(100,100,255,0.8)');
-        }
-    }
-
     // Draw selections
     selections.forEach((s, i) => {
         const isActive = i === activeIdx;
@@ -1114,8 +1063,6 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
             body: JSON.stringify({ format: fmt }),
         });
         const data = await resp.json();
-        // Store debug profiles for overlay visualization
-        autoDebugData = data.debug || null;
         if (data.ok && data.frames) {
             selectionsAreInherited = false;
             selections = data.frames.map(f => ({
@@ -1155,14 +1102,6 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
     }
 });
 
-document.getElementById('btn-dump').addEventListener('click', () => {
-    fetch('/debug/selections', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ selections }),
-    });
-    statusEl.textContent = `Dumped ${selections.length} selections to server console`;
-});
 
 document.getElementById('btn-clear').addEventListener('click', () => {
     selectionsAreInherited = false;

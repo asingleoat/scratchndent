@@ -459,8 +459,6 @@ def detect_frames(
     if gap_dim < 1:
         gap_dim = frame_strip_dim * 0.05
 
-    print(f"  Frame strip dim: {frame_strip_dim:.1f}px, gap: {gap_dim:.1f}px, "
-          f"strip len: {strip_len}px")
 
     # Build template: 1D array where 1.0 = expected edge, 0.0 = silence.
     # Use 90% of nominal frame dimension — the actual exposed frame is
@@ -484,7 +482,6 @@ def detect_frames(
     if template.max() > 0:
         template = template / template.max()
 
-    print(f"  Template length: {len(template)}, observation length: {len(obs)}")
 
     # DTW: find optimal alignment of template to observation.
     # We use a simple DTW that maps each template index to an observation index.
@@ -550,7 +547,6 @@ def detect_frames(
             nearest = min(alignment.keys(), key=lambda k: abs(k - ti))
             edge_obs_positions.append(alignment[nearest])
 
-    print(f"  DTW edge positions (raw): {edge_obs_positions}")
 
     # Snap each edge to the nearest strong gradient peak.
     # Frame-start edges (even indices) search forward-biased.
@@ -597,7 +593,6 @@ def detect_frames(
             snapped.append(max(int(min_pos), pos))
     edge_obs_positions = snapped
 
-    print(f"  DTW edge positions (snapped): {edge_obs_positions}")
 
     # Place frames from edge pairs, enforcing aspect ratio
     target_aspect = work_info["frame_w"] / max(work_info["frame_h"], 1)
@@ -864,8 +859,6 @@ def detect_frames(
                 else:
                     frames[i, 1] = cy + cross_center_offset * cos_a
                     frames[i, 3] = cross_w
-                print(f"  Frame {i+1} cross edges: {left_offset:.1f} to {right_offset:.1f} "
-                      f"(w={cross_w:.1f})")
 
     # Scale from work resolution back to full preview coords
     frames[:, :4] /= work_scale
@@ -892,21 +885,8 @@ def detect_frames(
 
     # Return profiles for debug visualization, scaled to full preview coords.
     # These are the work-resolution profiles — scale positions to match preview.
-    # Profile values normalized to [0, 1] for display.
-    def _norm(p):
-        mn, mx = p.min(), p.max()
-        return ((p - mn) / (mx - mn + 1e-10)).tolist() if len(p) > 0 else []
-
     print(f"  Detected {len(result_frames)} frames (aspect {aspect_str})")
     return {
         "frames": result_frames,
         "aspect": aspect_str,
-        "debug": {
-            "profile_a": _norm(grad_a),
-            "profile_b": _norm(grad_b),
-            "profile_c": _norm(grad_c),
-            "cross_profile": _norm(cross_prof),
-            "is_vertical": is_vert,
-            "work_scale": work_scale,
-        },
     }
