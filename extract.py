@@ -37,6 +37,7 @@ from scratchndent import (
 )
 from scratchndent.film_inversion import compute_dmin, invert_negative
 from scratchndent.film_render import render_to_display
+from scratchndent.auto_frame import FORMATS as AUTO_FRAME_FORMATS, detect_frames
 
 
 CONFIG_FILE = Path("scratchndent_config.toml")
@@ -839,6 +840,43 @@ class Handler(BaseHTTPRequestHandler):
             # Invalidate inversion cache if stock changed
             if "stock" in body:
                 invalidate_inversion_cache()
+            self._respond(200, "application/json",
+                          json.dumps({"ok": True}).encode())
+        elif self.path == "/auto-detect":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            fmt = body.get("format", "35mm_strip_6")
+            n_override = body.get("n_frames")
+            try:
+                # Use PREVIEW_RAW for detection (already downscaled)
+                if PREVIEW_RAW is not None:
+                    # detect_frames works in PREVIEW_RAW pixel coords,
+                    # which are the same as the UI's preview coords
+                    result = detect_frames(PREVIEW_RAW, fmt,
+                                           n_frames=n_override)
+                    self._respond(200, "application/json",
+                                  json.dumps({"ok": True,
+                                              "frames": result["frames"],
+                                              "aspect": result["aspect"],
+                                              "debug": result.get("debug")}).encode())
+                else:
+                    self._respond(400, "application/json",
+                                  json.dumps({"error": "No image loaded"}).encode())
+            except Exception as e:
+                print(f"  Auto-detect error: {e}")
+                self._respond(500, "application/json",
+                              json.dumps({"error": str(e)}).encode())
+        elif self.path == "/debug/selections":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            sels = body.get("selections", [])
+            print(f"\n  === Current selections ({len(sels)} frames) ===")
+            for i, s in enumerate(sels):
+                print(f"  Frame {i+1}: x={s['x']:.1f} y={s['y']:.1f} "
+                      f"w={s['w']:.1f} h={s['h']:.1f} "
+                      f"angle={s.get('angle',0):.4f}")
+            print(f"  (preview scale: {PREVIEW_SCALE:.4f})")
+            print()
             self._respond(200, "application/json",
                           json.dumps({"ok": True}).encode())
         elif self.path == "/scan/trash":
