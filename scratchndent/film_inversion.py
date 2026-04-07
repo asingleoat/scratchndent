@@ -67,7 +67,6 @@ def invert_negative(
     dark_rgb: np.ndarray | None = None,
     light_rgb: np.ndarray | None = None,
     rebate_mask: np.ndarray | None = None,
-    exposure_compensation: float = 0.0,
 ) -> np.ndarray:
     """Full film inversion: raw scan → scene-linear RGB.
 
@@ -120,11 +119,6 @@ def invert_negative(
         print(f"    Dmin: R={dmin[0]:.4f} G={dmin[1]:.4f} B={dmin[2]:.4f}")
 
     net_D = subtract_dmin(D, dmin)
-
-    # Optional exposure compensation (in density: positive = brighter)
-    if exposure_compensation != 0.0:
-        print(f"  Exposure compensation: {exposure_compensation:+.2f}")
-        net_D = net_D - exposure_compensation
 
     # Stage 3: Calibrated stock+scanner transform
     # The polynomial maps scanner net-density → corrected density,

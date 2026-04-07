@@ -52,7 +52,7 @@ def sigmoid_tonemap(
     mid_grey: float = 0.18,
     white_point: float = 1.0,
     black_point: float = 0.0,
-    contrast: float = 1.2,
+    contrast: float = 1.4,
 ) -> np.ndarray:
     """Apply filmic sigmoid tone mapping.
 
@@ -90,11 +90,12 @@ def apply_srgb_gamma(linear: np.ndarray) -> np.ndarray:
 def render_to_display(
     scene_linear: np.ndarray,
     *,
-    contrast: float = 1.2,
+    contrast: float = 1.4,
     black_point: float = 0.0,
     curve_k: float = 5.0,
     percentile_lo: float = 0.5,
     percentile_hi: float = 99.5,
+    exposure_compensation: float = 0.0,
 ) -> np.ndarray:
     """Render corrected density values to display-ready sRGB uint16.
 
@@ -140,19 +141,27 @@ def render_to_display(
     display = (img - lo) / (hi - lo)
     display = np.clip(display, 0.0, 1.0)
 
+    # Exposure compensation: applied after normalization as a power curve.
+    # Positive values brighten (gamma < 1), negative darken (gamma > 1).
+    # This preserves channel ratios (color-neutral) because it's applied
+    # equally to all channels in the normalized domain.
+    if abs(exposure_compensation) > 0.001:
+        gamma = 1.0 / (1.0 + exposure_compensation)
+        print(f"  Exposure compensation: {exposure_compensation:+.2f} (gamma={gamma:.3f})")
+        display = np.power(display, gamma)
+
     # S-curve for contrast: centered at 0.5, symmetric, adjustable strength.
     # Maps [0,1] → [0,1] with midtones expanded and extremes compressed.
-    # At contrast=1.0 this is the identity. Higher values add punch.
-    if contrast != 1.0:
-        # Attempt the logistic S-curve: y = 1 / (1 + exp(-k*(x - 0.5)))
-        # scaled so that (0,0) and (1,1) are preserved.
-        k = contrast * curve_k  # map contrast to steepness
-        raw = 1.0 / (1.0 + np.exp(-k * (display - 0.5)))
-        # Normalize so endpoints map to [0, 1]
-        raw_lo = 1.0 / (1.0 + np.exp(-k * (0.0 - 0.5)))
-        raw_hi = 1.0 / (1.0 + np.exp(-k * (1.0 - 0.5)))
-        display = (raw - raw_lo) / (raw_hi - raw_lo)
-        print(f"  S-curve contrast (k={k:.1f})")
+    # contrast=1.0 is identity (no curve). The effective steepness scales
+    # as (contrast - 1) so small adjustments above 1.0 are gentle.
+    if contrast > 1.001:
+        k = (contrast - 1.0) * curve_k  # 0 at contrast=1.0, ramps up smoothly
+        if k > 0.1:
+            raw = 1.0 / (1.0 + np.exp(-k * (display - 0.5)))
+            raw_lo = 1.0 / (1.0 + np.exp(-k * (0.0 - 0.5)))
+            raw_hi = 1.0 / (1.0 + np.exp(-k * (1.0 - 0.5)))
+            display = (raw - raw_lo) / (raw_hi - raw_lo)
+            print(f"  S-curve contrast (k={k:.1f})")
 
     # No sRGB gamma — density values are already perceptually spaced
     display = np.clip(display, 0.0, 1.0)

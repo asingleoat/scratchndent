@@ -56,6 +56,8 @@ body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; }
     <select id="file-select"></select>
     <button id="btn-next" title="Next">&rarr;</button>
     <span style="flex:1"></span>
+    <button id="btn-trash" title="Move current image to trash" onclick="trashCurrent()">Trash</button>
+    <button id="btn-delete" title="Permanently delete current image" onclick="deleteCurrent()" style="color:#d44">Delete</button>
     <button onclick="refreshList()">Refresh</button>
 </div>
 <div id="view-area">
@@ -207,9 +209,30 @@ document.getElementById('btn-next').addEventListener('click', () => {
     if (files.length > 0) showImage(currentIdx < files.length - 1 ? currentIdx + 1 : 0);
 });
 
+async function trashCurrent() {
+    if (currentIdx < 0 || !files[currentIdx]) return;
+    const name = files[currentIdx];
+    if (!confirm(`Move "${name}" to trash?`)) return;
+    const resp = await fetch('/gallery/trash/' + encodeURIComponent(name), { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = data.message || data.error;
+    if (data.ok) refreshList();
+}
+
+async function deleteCurrent() {
+    if (currentIdx < 0 || !files[currentIdx]) return;
+    const name = files[currentIdx];
+    if (!confirm(`Permanently delete "${name}"? This cannot be undone.`)) return;
+    const resp = await fetch('/gallery/delete/' + encodeURIComponent(name), { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = data.message || data.error;
+    if (data.ok) refreshList();
+}
+
 document.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowLeft') { e.preventDefault(); document.getElementById('btn-prev').click(); }
     if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-next').click(); }
+    if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); trashCurrent(); }
 });
 
 refreshList();

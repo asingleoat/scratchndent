@@ -81,6 +81,8 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-prev" title="Previous image">&larr;</button>
     <select id="img-select" style="font-size:13px;max-width:220px"></select>
     <button id="btn-next" title="Next image">&rarr;</button>
+    <button id="btn-scan-trash" title="Move current scan to trash">Trash</button>
+    <button id="btn-scan-delete" title="Permanently delete current scan" style="color:#d44">Delete</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label>Aspect:</label>
     <select id="aspect">
@@ -111,8 +113,9 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-rebate" title="Select an area of unexposed film (the orange strip between frames or at the edge of the strip) to calibrate base color removal">Set rebate</button>
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
-    <label><input type="checkbox" id="chk-ir" checked> IR clean</label>
-    <label><input type="checkbox" id="chk-invert" checked> Invert</label>
+    <label title="Export IR cleaned negative (dust/scratch removal only)"><input type="checkbox" id="chk-ir-neg"> IR cleaned</label>
+    <label title="Export inverted positive (with IR cleaning and color inversion)"><input type="checkbox" id="chk-ir-inv" checked> IR + inverted</label>
+    <label title="Export inverted positive without IR cleaning"><input type="checkbox" id="chk-inv-only"> Inverted only</label>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <span id="dmin-display" style="font-size:11px;color:#888"></span>
     <span style="flex:1"></span>
@@ -174,7 +177,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
         <div class="param-row" title="Shift the overall brightness in density space before rendering. Positive values produce a brighter image, negative values darken it">
             <label>Exposure compensation</label>
             <div class="param-ctrl">
-                <input type="range" data-param="exposure_compensation" min="-0.5" max="0.5" step="0.01">
+                <input type="range" data-param="exposure_compensation" min="-0.5" max="2.0" step="0.05">
                 <span class="param-val"></span>
             </div>
         </div>
@@ -309,7 +312,7 @@ function updateDminDisplay(dmin) {
 const PARAM_DEFAULTS = {
     ir_threshold: 0.10, ir_hair_sensitivity: 0.10, ir_min_area: 3,
     ir_dilate_radius: 4, ir_close_radius: 6, ir_max_coverage: 0.03,
-    inpaint_padding: 16, render_contrast: 1.2, render_curve_k: 5.0,
+    inpaint_padding: 16, render_contrast: 1.4, render_curve_k: 5.0,
     render_percentile_lo: 0.5, render_percentile_hi: 99.5,
     exposure_compensation: 0.0,
 };
@@ -339,13 +342,15 @@ stockSelect.addEventListener('change', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stock }),
     });
-    // Also update the Invert checkbox to match
-    document.getElementById('chk-invert').checked = !!stock;
-    fetch('/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invert: !!stock }),
-    });
+    // Enable IR+inverted when a stock is selected
+    if (stock) {
+        document.getElementById('chk-ir-inv').checked = true;
+        fetch('/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ export_ir_inv: true }),
+        });
+    }
 });
 
 function initParamSliders(cfg) {
@@ -391,12 +396,12 @@ fetch('/settings').then(r => r.json()).then(cfg => {
     if (cfg.aspect) {
         document.getElementById('aspect').value = cfg.aspect;
     }
-    if (cfg.ir_clean !== undefined) {
-        document.getElementById('chk-ir').checked = cfg.ir_clean;
-    }
-    if (cfg.invert !== undefined) {
-        document.getElementById('chk-invert').checked = cfg.invert;
-    }
+    if (cfg.export_ir_neg !== undefined)
+        document.getElementById('chk-ir-neg').checked = cfg.export_ir_neg;
+    if (cfg.export_ir_inv !== undefined)
+        document.getElementById('chk-ir-inv').checked = cfg.export_ir_inv;
+    if (cfg.export_inv_only !== undefined)
+        document.getElementById('chk-inv-only').checked = cfg.export_inv_only;
     updateDminDisplay(cfg.dmin || null);
     initParamSliders(cfg);
 });
@@ -475,20 +480,15 @@ document.getElementById('aspect').addEventListener('change', (e) => {
         body: JSON.stringify({ aspect: e.target.value }),
     });
 });
-document.getElementById('chk-ir').addEventListener('change', (e) => {
-    fetch('/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ir_clean: e.target.checked }),
+for (const [id, key] of [['chk-ir-neg', 'export_ir_neg'], ['chk-ir-inv', 'export_ir_inv'], ['chk-inv-only', 'export_inv_only']]) {
+    document.getElementById(id).addEventListener('change', (e) => {
+        fetch('/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ [key]: e.target.checked }),
+        });
     });
-});
-document.getElementById('chk-invert').addEventListener('change', (e) => {
-    fetch('/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invert: e.target.checked }),
-    });
-});
+}
 
 function getAspect() {
     const v = document.getElementById('aspect').value;
@@ -910,6 +910,32 @@ document.getElementById('btn-next').addEventListener('click', () => {
     });
 });
 
+document.getElementById('btn-scan-trash').addEventListener('click', async () => {
+    if (imageCount === 0) return;
+    const name = imgSelect.options[imgSelect.selectedIndex]?.textContent || '';
+    if (!confirm(`Move current scan to trash?\n${name}`)) return;
+    const resp = await fetch('/scan/trash', { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = data.message || data.error;
+    if (data.ok) {
+        await refreshImageList();
+        if (imageCount > 0) switchImage(Math.min(imageIdx, imageCount - 1));
+    }
+});
+
+document.getElementById('btn-scan-delete').addEventListener('click', async () => {
+    if (imageCount === 0) return;
+    const name = imgSelect.options[imgSelect.selectedIndex]?.textContent || '';
+    if (!confirm(`Permanently delete current scan? This cannot be undone.\n${name}`)) return;
+    const resp = await fetch('/scan/delete', { method: 'POST' });
+    const data = await resp.json();
+    statusEl.textContent = data.message || data.error;
+    if (data.ok) {
+        await refreshImageList();
+        if (imageCount > 0) switchImage(Math.min(imageIdx, imageCount - 1));
+    }
+});
+
 document.getElementById('btn-clear').addEventListener('click', () => {
     selectionsAreInherited = false;
     selections = []; activeIdx = -1; updateSelList(); render();
@@ -946,8 +972,9 @@ document.getElementById('btn-export').addEventListener('click', async () => {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
             basename, rects,
-            ir_clean: document.getElementById('chk-ir').checked,
-            invert: document.getElementById('chk-invert').checked,
+            export_ir_neg: document.getElementById('chk-ir-neg').checked,
+            export_ir_inv: document.getElementById('chk-ir-inv').checked,
+            export_inv_only: document.getElementById('chk-inv-only').checked,
         }),
         });
         const result = await resp.json();

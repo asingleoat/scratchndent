@@ -61,7 +61,7 @@ PARAM_DEFAULTS = {
     "inpaint_padding": 16,         # pixels at 800 DPI
 
     # Film rendering
-    "render_contrast": 1.2,
+    "render_contrast": 1.4,
     "render_curve_k": 5.0,
     "render_percentile_lo": 0.5,
     "render_percentile_hi": 99.5,
@@ -390,7 +390,6 @@ def apply_inversion(img: np.ndarray) -> np.ndarray:
         dmin=DMIN,
         stock=stock or "kodak_gold",
         coeffs=coeffs,
-        exposure_compensation=get_param("exposure_compensation"),
     )
     return render_to_display(
         scene_linear,
@@ -398,6 +397,7 @@ def apply_inversion(img: np.ndarray) -> np.ndarray:
         curve_k=get_param("render_curve_k"),
         percentile_lo=get_param("render_percentile_lo"),
         percentile_hi=get_param("render_percentile_hi"),
+        exposure_compensation=get_param("exposure_compensation"),
     )
 
 
@@ -605,7 +605,10 @@ def crop_rotated_rect(
     out_w = int(math.ceil(w)) + pad * 2
     out_h = int(math.ceil(h)) + pad * 2
 
-    M = cv2.getRotationMatrix2D((local_cx, local_cy), -angle_deg, 1.0)
+    # Rotate the image opposite to the selection angle so the selected
+    # region becomes axis-aligned. OpenCV positive = CCW, UI positive = CW,
+    # so we pass angle_deg directly (UI CW → OpenCV CCW = correct undo).
+    M = cv2.getRotationMatrix2D((local_cx, local_cy), angle_deg, 1.0)
     M[0, 2] += out_w / 2 - local_cx
     M[1, 2] += out_h / 2 - local_cy
 
@@ -692,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_export_jpeg(name, max_dim=200)
         elif parsed.path.startswith("/gallery/full/"):
             name = parsed.path[len("/gallery/full/"):]
-            self._serve_export_jpeg(name, max_dim=2400)
+            self._serve_export_jpeg(name, max_dim=0)
         else:
             self._respond(404, "text/plain", b"Not found")
 
@@ -755,8 +758,96 @@ class Handler(BaseHTTPRequestHandler):
             save_config(body)
             self._respond(200, "application/json",
                           json.dumps({"ok": True}).encode())
+        elif self.path == "/scan/trash":
+            self._scan_trash()
+        elif self.path == "/scan/delete":
+            self._scan_delete()
+        elif self.path.startswith("/gallery/trash/"):
+            name = self.path[len("/gallery/trash/"):]
+            self._gallery_trash(name)
+        elif self.path.startswith("/gallery/delete/"):
+            name = self.path[len("/gallery/delete/"):]
+            self._gallery_delete(name)
         else:
             self._respond(404, "text/plain", b"Not found")
+
+    def _gallery_resolve(self, name: str) -> Path | None:
+        """Resolve and validate a gallery filename."""
+        from urllib.parse import unquote
+        name = unquote(name)
+        path = OUTPUT_DIR / name
+        if not path.exists() or not path.is_file():
+            self._respond(404, "application/json",
+                          json.dumps({"error": "File not found"}).encode())
+            return None
+        # Prevent path traversal
+        if OUTPUT_DIR not in path.resolve().parents and path.resolve() != OUTPUT_DIR:
+            self._respond(403, "application/json",
+                          json.dumps({"error": "Access denied"}).encode())
+            return None
+        return path
+
+    def _scan_trash(self):
+        """Move the current scan to a .trash subdirectory."""
+        if IMAGE_IDX >= len(IMAGE_LIST):
+            self._respond(400, "application/json",
+                          json.dumps({"error": "No image loaded"}).encode())
+            return
+        path = Path(IMAGE_LIST[IMAGE_IDX])
+        scan_dir = path.parent
+        trash_dir = scan_dir / ".trash"
+        trash_dir.mkdir(exist_ok=True)
+        dest = trash_dir / path.name
+        n = 1
+        while dest.exists():
+            dest = trash_dir / f"{path.stem}_{n}{path.suffix}"
+            n += 1
+        path.rename(dest)
+        print(f"  Trashed scan: {path.name} -> .trash/{dest.name}")
+        rescan_images()
+        self._respond(200, "application/json",
+                      json.dumps({"ok": True, "message": f"Moved {path.name} to trash"}).encode())
+
+    def _scan_delete(self):
+        """Permanently delete the current scan."""
+        if IMAGE_IDX >= len(IMAGE_LIST):
+            self._respond(400, "application/json",
+                          json.dumps({"error": "No image loaded"}).encode())
+            return
+        path = Path(IMAGE_LIST[IMAGE_IDX])
+        name = path.name
+        path.unlink()
+        print(f"  Deleted scan: {name}")
+        rescan_images()
+        self._respond(200, "application/json",
+                      json.dumps({"ok": True, "message": f"Deleted {name}"}).encode())
+
+    def _gallery_trash(self, name: str):
+        """Move an export to a .trash subdirectory."""
+        path = self._gallery_resolve(name)
+        if path is None:
+            return
+        trash_dir = OUTPUT_DIR / ".trash"
+        trash_dir.mkdir(exist_ok=True)
+        dest = trash_dir / path.name
+        n = 1
+        while dest.exists():
+            dest = trash_dir / f"{path.stem}_{n}{path.suffix}"
+            n += 1
+        path.rename(dest)
+        print(f"  Trashed: {path.name} -> .trash/{dest.name}")
+        self._respond(200, "application/json",
+                      json.dumps({"ok": True, "message": f"Moved {path.name} to trash"}).encode())
+
+    def _gallery_delete(self, name: str):
+        """Permanently delete an export."""
+        path = self._gallery_resolve(name)
+        if path is None:
+            return
+        path.unlink()
+        print(f"  Deleted: {path.name}")
+        self._respond(200, "application/json",
+                      json.dumps({"ok": True, "message": f"Deleted {path.name}"}).encode())
 
     def _serve_export_jpeg(self, name: str, max_dim: int = 2400):
         """Serve an exported TIFF as a JPEG preview."""
@@ -772,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
             if img.dtype == np.uint16:
                 img = (img >> 8).astype(np.uint8)
             h, w = img.shape[:2]
-            scale = min(max_dim / max(h, w), 1.0)
+            scale = min(max_dim / max(h, w), 1.0) if max_dim > 0 else 1.0
             if scale < 1.0:
                 img = cv2.resize(img, (int(w * scale), int(h * scale)),
                                  interpolation=cv2.INTER_AREA)
@@ -791,6 +882,25 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _apply_rotation(img: np.ndarray, rotation: int) -> np.ndarray:
+    """Apply output rotation (0, 90, 180, 270 degrees CW)."""
+    if rotation == 90:
+        return np.rot90(img, k=-1)
+    elif rotation == 180:
+        return np.rot90(img, k=2)
+    elif rotation == 270:
+        return np.rot90(img, k=1)
+    return img
+
+
+def _write_tiff(path: str, img: np.ndarray, meta: dict) -> None:
+    """Write a TIFF with embedded metadata."""
+    meta_json = json.dumps(meta)
+    tifffile.imwrite(path, img, extratags=[
+        (65000, 's', 0, meta_json, True),
+    ])
+
+
 def _process_frame(
     frame_idx: int,
     rect: dict,
@@ -799,23 +909,36 @@ def _process_frame(
     ir_scale_x: float,
     ir_scale_y: float,
     film_stock: str | None,
+    stock_coeffs: np.ndarray | None,
     dmin: np.ndarray | None,
-    out_path: str,
-    meta: dict,
+    outputs: dict,
+    out_paths: dict,
+    base_meta: dict,
 ) -> dict:
-    """Process and export a single frame. Designed to run in a worker process."""
+    """Process and export a single frame with multiple output variants.
+
+    outputs: dict with keys "ir_neg", "ir_inv", "inv_only" → bool
+    out_paths: dict with same keys → file path strings
+    """
     timings = {}
     t0 = time.monotonic()
+    written = []
 
     cx, cy, w, h = rect["cx"], rect["cy"], rect["w"], rect["h"]
     angle = rect.get("angle", 0)
+    rotation = rect.get("rotation", 0)
+
+    need_ir = outputs.get("ir_neg") or outputs.get("ir_inv")
+    need_invert_clean = outputs.get("ir_inv")
+    need_invert_raw = outputs.get("inv_only")
 
     t = time.monotonic()
-    cropped = crop_rotated_rect(rgb_img, cx, cy, w, h, angle)
+    raw_crop = crop_rotated_rect(rgb_img, cx, cy, w, h, angle)
     timings["crop"] = time.monotonic() - t
 
-    # Per-crop IR cleaning
-    if aligned_ir is not None:
+    # IR cleaning (computed once, reused for ir_neg and ir_inv)
+    ir_cleaned = None
+    if need_ir and aligned_ir is not None:
         t = time.monotonic()
         ir_cropped = crop_rotated_rect(
             aligned_ir,
@@ -823,57 +946,101 @@ def _process_frame(
             w * ir_scale_x, h * ir_scale_y,
             angle,
         )
-        cropped = ir_clean_region(cropped, ir_cropped)
+        ir_cleaned = ir_clean_region(raw_crop, ir_cropped)
         timings["ir_clean"] = time.monotonic() - t
+    elif need_ir:
+        ir_cleaned = raw_crop  # no IR channel available, pass through
 
-    if film_stock:
+    def _invert(img):
         t = time.monotonic()
         scene_linear = invert_negative(
-            cropped,
+            img,
             dmin=dmin,
-            stock=film_stock,
-            exposure_compensation=get_param("exposure_compensation"),
+            coeffs=stock_coeffs,
+            stock=film_stock or "kodak_gold",
         )
-        timings["invert"] = time.monotonic() - t
-
-        t = time.monotonic()
-        cropped = render_to_display(
+        result = render_to_display(
             scene_linear,
             contrast=get_param("render_contrast"),
             curve_k=get_param("render_curve_k"),
             percentile_lo=get_param("render_percentile_lo"),
             percentile_hi=get_param("render_percentile_hi"),
+            exposure_compensation=get_param("exposure_compensation"),
         )
-        timings["render"] = time.monotonic() - t
+        return result, time.monotonic() - t
 
-    # Apply output rotation
-    rotation = rect.get("rotation", 0)
-    if rotation == 90:
-        cropped = np.rot90(cropped, k=-1)
-    elif rotation == 180:
-        cropped = np.rot90(cropped, k=2)
-    elif rotation == 270:
-        cropped = np.rot90(cropped, k=1)
+    # Export: IR cleaned negative
+    if outputs.get("ir_neg") and ir_cleaned is not None:
+        t = time.monotonic()
+        out = _apply_rotation(ir_cleaned, rotation)
+        meta = {**base_meta, "variant": "ir_cleaned"}
+        _write_tiff(out_paths["ir_neg"], out, meta)
+        timings["write_ir_neg"] = time.monotonic() - t
+        written.append(Path(out_paths["ir_neg"]).name)
 
-    t = time.monotonic()
-    meta_json = json.dumps(meta)
-    tifffile.imwrite(out_path, cropped, extratags=[
-        (65000, 's', 0, meta_json, True),
-    ])
-    timings["write"] = time.monotonic() - t
+    # Export: IR cleaned + inverted
+    if need_invert_clean and ir_cleaned is not None:
+        inverted, t_inv = _invert(ir_cleaned)
+        timings["invert"] = t_inv
+        t = time.monotonic()
+        out = _apply_rotation(inverted, rotation)
+        meta = {**base_meta, "variant": "ir_cleaned_inverted",
+                "stock": film_stock, "contrast": get_param("render_contrast"),
+                "dmin": dmin.tolist() if dmin is not None else None}
+        _write_tiff(out_paths["ir_inv"], out, meta)
+        timings["write_ir_inv"] = time.monotonic() - t
+        written.append(Path(out_paths["ir_inv"]).name)
+
+    # Export: inverted only (no IR cleaning)
+    if need_invert_raw:
+        inverted, t_inv = _invert(raw_crop)
+        timings.setdefault("invert", t_inv)
+        t = time.monotonic()
+        out = _apply_rotation(inverted, rotation)
+        meta = {**base_meta, "variant": "inverted",
+                "stock": film_stock, "contrast": get_param("render_contrast"),
+                "dmin": dmin.tolist() if dmin is not None else None}
+        _write_tiff(out_paths["inv_only"], out, meta)
+        timings["write_inv_only"] = time.monotonic() - t
+        written.append(Path(out_paths["inv_only"]).name)
 
     timings["total"] = time.monotonic() - t0
-    return {"out_path": out_path, "timings": timings,
-            "shape": (cropped.shape[1], cropped.shape[0])}
+    shape = (raw_crop.shape[1], raw_crop.shape[0])
+    return {"written": written, "timings": timings, "shape": shape}
+
+
+def _unique_path(base_path: Path) -> Path:
+    """Return a path that doesn't conflict with existing files."""
+    if not base_path.exists():
+        return base_path
+    stem = base_path.stem
+    suffix = base_path.suffix
+    parent = base_path.parent
+    n = 1
+    while True:
+        candidate = parent / f"{stem}_{n}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
 
 
 def handle_export(body: dict) -> dict:
     default_base = Path(INPUT_PATH).stem
     basename = body.get("basename", default_base)
     rects = body.get("rects", [])
-    ir_clean = body.get("ir_clean", True)
-    invert = body.get("invert", True)
     n_rects = len(rects)
+
+    # Which output variants are requested
+    outputs = {
+        "ir_neg": body.get("export_ir_neg", False),
+        "ir_inv": body.get("export_ir_inv", True),
+        "inv_only": body.get("export_inv_only", False),
+    }
+    if not any(outputs.values()):
+        return {"message": "No output variants selected", "files": []}
+
+    need_ir = outputs["ir_neg"] or outputs["ir_inv"]
+    need_invert = outputs["ir_inv"] or outputs["inv_only"]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -890,7 +1057,7 @@ def handle_export(body: dict) -> dict:
     aligned_ir = None
     ir_scale_x = ir_scale_y = 1.0
     t_align = 0.0
-    if ir_clean and FULL_IR is not None:
+    if need_ir and FULL_IR is not None:
         set_progress("Aligning IR channel (full strip)...")
         t = time.monotonic()
         aligned_ir = align_ir(FULL_IMG, FULL_IR)
@@ -900,72 +1067,68 @@ def handle_export(body: dict) -> dict:
         ir_scale_x = ir_w / rgb_w
         ir_scale_y = ir_h / rgb_h
 
-    # Build output paths and metadata for each frame
+    film_stock = get_active_stock() if need_invert else None
+    stock_coeffs = get_stock_coeffs(film_stock) if film_stock else None
+
+    # Suffixes for each variant
+    suffixes = {"ir_neg": "_ir", "ir_inv": "", "inv_only": "_inv"}
+
+    # Build jobs for each frame
     frame_jobs = []
     for i, r in enumerate(rects):
         cx, cy, w, h = r["cx"], r["cy"], r["w"], r["h"]
         angle = r.get("angle", 0)
 
-        out_name = f"{basename}_{i + 1:02d}.tif"
-        out_path = OUTPUT_DIR / out_name
-        n = 1
-        while out_path.exists():
-            out_name = f"{basename}_{i + 1:02d}_{n}.tif"
-            out_path = OUTPUT_DIR / out_name
-            n += 1
+        out_paths = {}
+        for variant, enabled in outputs.items():
+            if enabled:
+                suffix = suffixes[variant]
+                path = _unique_path(OUTPUT_DIR / f"{basename}_{i + 1:02d}{suffix}.tif")
+                out_paths[variant] = str(path)
 
-        meta = {
+        base_meta = {
             "source": Path(INPUT_PATH).name,
-            "stock": get_active_stock() if invert else None,
-            "contrast": get_param("render_contrast") if invert else None,
-            "ir_clean": ir_clean and aligned_ir is not None,
-            "invert": invert,
-            "dmin": DMIN.tolist() if DMIN is not None and invert else None,
             "rebate_rect": REBATE_RECT,
             "crop": {"cx": cx, "cy": cy, "w": w, "h": h, "angle": angle},
         }
-        frame_jobs.append((i, r, str(out_path), out_name, meta))
+        frame_jobs.append((i, r, out_paths, base_meta))
 
     # Process frames in parallel
-    set_progress(f"Processing {n_rects} frame{'s' if n_rects != 1 else ''} in parallel...")
-    exported = [None] * n_rects
+    set_progress(f"Processing {n_rects} frame{'s' if n_rects != 1 else ''}...")
+    all_written = []
     all_timings = [None] * n_rects
 
-    film_stock = get_active_stock() if invert else None
+    def run_frame(i, r, out_paths, base_meta):
+        return _process_frame(
+            i, r, FULL_IMG, aligned_ir, ir_scale_x, ir_scale_y,
+            film_stock, stock_coeffs, DMIN, outputs, out_paths, base_meta,
+        )
 
     if n_rects == 1:
-        # Single frame — no pool overhead
-        i, r, out_path, out_name, meta = frame_jobs[0]
-        result = _process_frame(
-            i, r, FULL_IMG, aligned_ir, ir_scale_x, ir_scale_y,
-            film_stock, DMIN, out_path, meta,
-        )
-        exported[0] = out_name
+        i, r, out_paths, base_meta = frame_jobs[0]
+        result = run_frame(i, r, out_paths, base_meta)
+        all_written.extend(result["written"])
         all_timings[0] = result["timings"]
-        set_progress(f"Wrote {out_name} ({result['shape'][0]}x{result['shape'][1]})")
+        for name in result["written"]:
+            set_progress(f"Wrote {name}")
     else:
-        # Multiple frames — use thread pool (numpy/numba release GIL)
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(n_rects, 4)) as pool:
             futures = {}
-            for i, r, out_path, out_name, meta in frame_jobs:
-                fut = pool.submit(
-                    _process_frame,
-                    i, r, FULL_IMG, aligned_ir, ir_scale_x, ir_scale_y,
-                    film_stock, DMIN, out_path, meta,
-                )
-                futures[fut] = (i, out_name)
+            for i, r, out_paths, base_meta in frame_jobs:
+                fut = pool.submit(run_frame, i, r, out_paths, base_meta)
+                futures[fut] = i
 
             for fut in as_completed(futures):
-                i, out_name = futures[fut]
+                i = futures[fut]
                 result = fut.result()
-                exported[i] = out_name
+                all_written.extend(result["written"])
                 all_timings[i] = result["timings"]
-                set_progress(f"Wrote {out_name} ({result['shape'][0]}x{result['shape'][1]})")
+                for name in result["written"]:
+                    set_progress(f"Wrote {name}")
 
     t_total = time.monotonic() - t_start
 
-    # Print timing summary
     print(f"\n  === Export timing summary ===")
     print(f"  Load:      {t_load:.2f}s")
     if t_align > 0:
@@ -976,9 +1139,9 @@ def handle_export(body: dict) -> dict:
             print(f"  Frame {i+1}:   {parts}")
     print(f"  Total:     {t_total:.2f}s\n")
 
-    msg = f"Exported {len(exported)} frame{'s' if len(exported) != 1 else ''} to {OUTPUT_DIR}/ ({t_total:.1f}s)"
+    msg = f"Exported {len(all_written)} file{'s' if len(all_written) != 1 else ''} to {OUTPUT_DIR}/ ({t_total:.1f}s)"
     set_progress(msg)
-    return {"message": msg, "files": exported}
+    return {"message": msg, "files": all_written}
 
 
 TIFF_EXTS = {".tif", ".tiff"}
