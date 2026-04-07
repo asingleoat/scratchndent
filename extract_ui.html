@@ -119,6 +119,8 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
         <option value="6x9">6x9</option>
     </select>
     <button id="btn-auto" title="Automatically detect frame positions based on film format">Auto Detect</button>
+    <input id="auto-scale" type="number" value="0" min="-1" max="1" step="0.1"
+           style="width:62px;font-size:12px" title="Scale adjustment for auto-detected frames (%). Positive grows frames, negative shrinks them.">%
     <button id="btn-clear" class="danger">Clear all</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label title="Export IR cleaned negative (dust/scratch removal only)"><input type="checkbox" id="chk-ir-neg"> IR cleaned</label>
@@ -617,6 +619,7 @@ function getAspect() {
 let lastAngle = 0, lastW = 0, lastH = 0;
 let lastRotation = 270; // default: 270° CW (scanner vertical, photos landscape)
 let previousSelections = []; // saved from last image for carry-over
+let lastAutoFrames = null;   // last auto-detected frames (unscaled) for rescaling
 let selectionsAreInherited = false; // true if current selections came from previous image
 
 function addSelection(x, y, w, h, angle = lastAngle) {
@@ -1065,11 +1068,14 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
         const data = await resp.json();
         if (data.ok && data.frames) {
             selectionsAreInherited = false;
+            lastAutoFrames = data.frames;
+            const scalePct = parseFloat(document.getElementById('auto-scale').value) || 0;
+            const s = 1 + scalePct / 100;
             selections = data.frames.map(f => ({
-                x: f.cx - f.w / 2,
-                y: f.cy - f.h / 2,
-                w: f.w,
-                h: f.h,
+                x: f.cx - (f.w * s) / 2,
+                y: f.cy - (f.h * s) / 2,
+                w: f.w * s,
+                h: f.h * s,
                 angle: f.angle,
                 rotation: lastRotation,
             }));
@@ -1100,6 +1106,23 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
     } catch (e) {
         statusEl.textContent = 'Auto-detect error: ' + e.message;
     }
+});
+
+document.getElementById('auto-scale').addEventListener('input', () => {
+    if (!lastAutoFrames) return;
+    const scalePct = parseFloat(document.getElementById('auto-scale').value) || 0;
+    const s = 1 + scalePct / 100;
+    selections = lastAutoFrames.map(f => ({
+        x: f.cx - (f.w * s) / 2,
+        y: f.cy - (f.h * s) / 2,
+        w: f.w * s,
+        h: f.h * s,
+        angle: f.angle,
+        rotation: lastRotation,
+    }));
+    activeIdx = 0;
+    updateSelList();
+    render();
 });
 
 
