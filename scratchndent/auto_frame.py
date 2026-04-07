@@ -685,6 +685,83 @@ def detect_frames(
                 angle = max(-max_angle, min(max_angle, angle))
                 frames[i, 4] = angle
 
+    # Per-frame cross-strip edge detection.
+    # For each frame, take many 1D projections along the cross-strip axis
+    # from within the frame interior. Frame edges show as consistent gradient
+    # peaks; sprocket holes are localized and get rejected by the median.
+    n_cross_samples = 15
+    cross_dim_px = sw if is_vert else sh
+    cross_search_r = max(3, int(cross_dim_px * 0.02))
+
+    for i in range(actual_n):
+        if is_vert:
+            frame_y_start = int(frames[i, 1] - frames[i, 3] / 2)
+            frame_y_end = int(frames[i, 1] + frames[i, 3] / 2)
+            # Sample from the middle 60% of the frame to avoid edge artifacts
+            margin = int((frame_y_end - frame_y_start) * 0.2)
+            sample_ys = np.linspace(frame_y_start + margin,
+                                    frame_y_end - margin,
+                                    n_cross_samples).astype(int)
+            sample_ys = sample_ys[(sample_ys >= 0) & (sample_ys < sh)]
+        else:
+            frame_x_start = int(frames[i, 0] - frames[i, 2] / 2)
+            frame_x_end = int(frames[i, 0] + frames[i, 2] / 2)
+            margin = int((frame_x_end - frame_x_start) * 0.2)
+            sample_xs = np.linspace(frame_x_start + margin,
+                                    frame_x_end - margin,
+                                    n_cross_samples).astype(int)
+            sample_xs = sample_xs[(sample_xs >= 0) & (sample_xs < sw)]
+
+        left_edges = []
+        right_edges = []
+
+        for s in range(len(sample_ys) if is_vert else len(sample_xs)):
+            if is_vert:
+                row = img_f[sample_ys[s], :].copy()
+            else:
+                row = img_f[:, sample_xs[s]].copy()
+
+            # Smooth and compute gradient
+            k = max(3, len(row) // 50) | 1
+            row = cv2.GaussianBlur(row.reshape(1, -1), (k, 1), 0).ravel()
+            g = np.abs(np.gradient(row))
+            g[0] = 0; g[-1] = 0
+
+            # Expected frame center in cross direction
+            cross_center = int(frames[i, 0] if is_vert else frames[i, 1])
+            half_w = int((frames[i, 2] if is_vert else frames[i, 3]) / 2)
+
+            # Search for left edge: strongest gradient peak left of center
+            left_target = cross_center - half_w
+            l_lo = max(0, left_target - cross_search_r)
+            l_hi = min(len(g), left_target + cross_search_r + 1)
+            if l_hi > l_lo:
+                left_edges.append(l_lo + int(np.argmax(g[l_lo:l_hi])))
+
+            # Search for right edge: strongest gradient peak right of center
+            right_target = cross_center + half_w
+            r_lo = max(0, right_target - cross_search_r)
+            r_hi = min(len(g), right_target + cross_search_r + 1)
+            if r_hi > r_lo:
+                right_edges.append(r_lo + int(np.argmax(g[r_lo:r_hi])))
+
+        if left_edges and right_edges:
+            # Median to reject sprocket-hole outliers
+            left_edge = float(np.median(left_edges))
+            right_edge = float(np.median(right_edges))
+            cross_w = right_edge - left_edge
+            cross_cx = (left_edge + right_edge) / 2
+
+            if cross_w > 0:
+                if is_vert:
+                    frames[i, 0] = cross_cx
+                    frames[i, 2] = cross_w
+                else:
+                    frames[i, 1] = cross_cx
+                    frames[i, 3] = cross_w
+                print(f"  Frame {i+1} cross edges: {left_edge:.1f} - {right_edge:.1f} "
+                      f"(w={cross_w:.1f})")
+
     # Scale from work resolution back to full preview coords
     frames[:, :4] /= work_scale
 
