@@ -380,8 +380,12 @@ def detect_frames(
     else:
         gray = image
 
-    # Invert and enhance contrast — makes inter-frame gaps clearly visible
+    # Invert — makes frame content bright, gaps dark
     gray = 255 - gray
+    # Keep a non-CLAHE copy for cross-strip edge detection (CLAHE creates
+    # tile-boundary artifacts that bias edge positions)
+    gray_raw_inv = gray.copy()
+    # CLAHE for strip-axis detection (needs contrast in low-contrast gaps)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
@@ -391,8 +395,11 @@ def detect_frames(
     if work_scale < 1.0:
         gray_small = cv2.resize(gray, (int(img_w * work_scale), int(img_h * work_scale)),
                                 interpolation=cv2.INTER_AREA)
+        gray_raw_small = cv2.resize(gray_raw_inv, (int(img_w * work_scale), int(img_h * work_scale)),
+                                    interpolation=cv2.INTER_AREA)
     else:
         gray_small = gray
+        gray_raw_small = gray_raw_inv
         work_scale = 1.0
 
     sh, sw = gray_small.shape[:2]
@@ -686,80 +693,178 @@ def detect_frames(
                 frames[i, 4] = angle
 
     # Per-frame cross-strip edge detection.
-    # For each frame, take many 1D projections along the cross-strip axis
-    # from within the frame interior. Frame edges show as consistent gradient
-    # peaks; sprocket holes are localized and get rejected by the median.
+    # Uses the non-CLAHE inverted image to avoid tile-boundary artifacts
+    # that bias edge positions. CLAHE is great for finding inter-frame gaps
+    # along the strip but creates asymmetric edges across the strip.
+    img_cross = gray_raw_small.astype(np.float64)
     n_cross_samples = 15
     cross_dim_px = sw if is_vert else sh
     cross_search_r = max(3, int(cross_dim_px * 0.02))
 
     for i in range(actual_n):
-        if is_vert:
-            frame_y_start = int(frames[i, 1] - frames[i, 3] / 2)
-            frame_y_end = int(frames[i, 1] + frames[i, 3] / 2)
-            # Sample from the middle 60% of the frame to avoid edge artifacts
-            margin = int((frame_y_end - frame_y_start) * 0.2)
-            sample_ys = np.linspace(frame_y_start + margin,
-                                    frame_y_end - margin,
-                                    n_cross_samples).astype(int)
-            sample_ys = sample_ys[(sample_ys >= 0) & (sample_ys < sh)]
-        else:
-            frame_x_start = int(frames[i, 0] - frames[i, 2] / 2)
-            frame_x_end = int(frames[i, 0] + frames[i, 2] / 2)
-            margin = int((frame_x_end - frame_x_start) * 0.2)
-            sample_xs = np.linspace(frame_x_start + margin,
-                                    frame_x_end - margin,
-                                    n_cross_samples).astype(int)
-            sample_xs = sample_xs[(sample_xs >= 0) & (sample_xs < sw)]
+        cx, cy = frames[i, 0], frames[i, 1]
+        angle = frames[i, 4]
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        strip_dim = frames[i, 3] if is_vert else frames[i, 2]
+        # Derive expected cross width from detected strip dimension + aspect ratio
+        cross_dim_est = strip_dim * target_aspect
+
+        # Sample positions along the frame's strip axis (middle 60%)
+        margin_frac = 0.2
+        offsets = np.linspace(-strip_dim / 2 * (1 - margin_frac),
+                               strip_dim / 2 * (1 - margin_frac),
+                               n_cross_samples)
 
         left_edges = []
         right_edges = []
 
-        for s in range(len(sample_ys) if is_vert else len(sample_xs)):
+        for offset in offsets:
+            # Point along the frame's strip axis (rotated)
             if is_vert:
-                row = img_f[sample_ys[s], :].copy()
+                # Strip axis is roughly y; offset moves along y
+                sample_y = cy + offset * cos_a
+                sample_x_base = cx + offset * sin_a
             else:
-                row = img_f[:, sample_xs[s]].copy()
+                sample_x_base = cx + offset * cos_a
+                sample_y = cy + offset * sin_a
 
-            # Smooth and compute gradient
+            # Sample a 1D line perpendicular to the strip axis through this point
+            # For a vertical strip, "perpendicular" is roughly x-direction,
+            # rotated by the frame angle
+            n_pts = int(cross_dim_px)
+            # Sample coordinates: pixel offsets from the sample center point
+            # t[i] is the offset in pixels, with t=0 at the center
+            t = np.linspace(-(n_pts - 1) / 2, (n_pts - 1) / 2, n_pts)
+
+            if is_vert:
+                # Cross direction is roughly x, rotated
+                xs = sample_x_base + t * cos_a
+                ys = sample_y - t * sin_a
+            else:
+                xs = sample_x_base - t * sin_a
+                ys = sample_y + t * cos_a
+
+            # Clip to image bounds
+            valid = (xs >= 0) & (xs < sw - 1) & (ys >= 0) & (ys < sh - 1)
+            if valid.sum() < n_pts * 0.5:
+                continue
+
+            # Sample using bilinear interpolation
+            row = cv2.remap(
+                img_cross.astype(np.float32),
+                xs.astype(np.float32).reshape(1, -1),
+                ys.astype(np.float32).reshape(1, -1),
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).ravel()
+
+            # Smooth and compute SIGNED gradient.
+            # Left frame edge: dark→bright (outside→inside) = positive gradient
+            # Right frame edge: bright→dark (inside→outside) = negative gradient
+            # Using signed gradient rejects sprocket holes which create
+            # gradients of both signs near the frame edge.
             k = max(3, len(row) // 50) | 1
             row = cv2.GaussianBlur(row.reshape(1, -1), (k, 1), 0).ravel()
-            g = np.abs(np.gradient(row))
-            g[0] = 0; g[-1] = 0
+            g_signed = np.gradient(row)
+            g_signed[:2] = 0; g_signed[-2:] = 0
 
-            # Expected frame center in cross direction
-            cross_center = int(frames[i, 0] if is_vert else frames[i, 1])
-            half_w = int((frames[i, 2] if is_vert else frames[i, 3]) / 2)
+            half_w = cross_dim_est / 2
 
-            # Search for left edge: strongest gradient peak left of center
-            left_target = cross_center - half_w
-            l_lo = max(0, left_target - cross_search_r)
-            l_hi = min(len(g), left_target + cross_search_r + 1)
-            if l_hi > l_lo:
-                left_edges.append(l_lo + int(np.argmax(g[l_lo:l_hi])))
+            def t_to_idx(t_val):
+                return int(round(t_val + (n_pts - 1) / 2))
 
-            # Search for right edge: strongest gradient peak right of center
-            right_target = cross_center + half_w
-            r_lo = max(0, right_target - cross_search_r)
-            r_hi = min(len(g), right_target + cross_search_r + 1)
-            if r_hi > r_lo:
-                right_edges.append(r_lo + int(np.argmax(g[r_lo:r_hi])))
+            def _subpixel_peak(g, lo, hi):
+                """Find sub-pixel peak via quadratic interpolation."""
+                idx = lo + int(np.argmax(g[lo:hi]))
+                if 0 < idx - lo < hi - lo - 1:
+                    a = g[idx - 1]
+                    b = g[idx]
+                    c = g[idx + 1]
+                    denom = a - 2 * b + c
+                    if abs(denom) > 1e-10:
+                        offset = 0.5 * (a - c) / denom
+                        return idx + offset
+                return float(idx)
+
+            # Paired product indexed by CENTER position:
+            #   score[c] = g_pos[c - hw] * g_neg[c + hw]
+            # High only where both edges exist at the expected separation,
+            # symmetric around c. The peak of this array is the frame center.
+            g_pos = np.maximum(g_signed, 0)
+            g_neg = np.maximum(-g_signed, 0)
+
+            hw_idx = int(round(half_w * (n_pts - 1) / (t[-1] - t[0])))
+
+            if hw_idx > 0 and hw_idx < len(g_pos) // 2:
+                lo_c = hw_idx
+                hi_c = len(g_pos) - hw_idx
+                paired = g_pos[lo_c - hw_idx:hi_c - hw_idx] * g_neg[lo_c + hw_idx:hi_c + hw_idx]
+
+                # Search near expected center
+                center_target_idx = t_to_idx(0) - lo_c
+                search_lo = max(0, center_target_idx - cross_search_r)
+                search_hi = min(len(paired), center_target_idx + cross_search_r + 1)
+
+                if search_hi > search_lo and paired[search_lo:search_hi].max() > 0:
+                    # Find coarse center from paired product
+                    coarse_k = search_lo + int(np.argmax(paired[search_lo:search_hi]))
+                    # Left edge image index and right edge image index
+                    left_img_idx = coarse_k  # = coarse_k + lo_c - hw_idx = coarse_k
+                    right_img_idx = coarse_k + 2 * hw_idx
+
+                    # Sub-pixel refine each edge independently using signed gradients
+                    left_f = _subpixel_peak(g_pos,
+                                            max(0, left_img_idx - 2),
+                                            min(len(g_pos), left_img_idx + 3))
+                    right_f = _subpixel_peak(g_neg,
+                                             max(0, right_img_idx - 2),
+                                             min(len(g_neg), right_img_idx + 3))
+
+                    # Convert from image index to t-offset (pixel offset from
+                    # the sample line center).
+                    #
+                    # ARGMAX BIAS CORRECTION (+1.0):
+                    # np.argmax returns the first index when values tie. For
+                    # a symmetric gradient peak spanning two pixels (common at
+                    # step edges where the central-difference gradient is equal
+                    # at positions i and i+1), argmax always returns i — a
+                    # consistent 0.5px bias toward lower indices.
+                    #
+                    # This bias compounds through two stages:
+                    # 1. The paired product g_pos[i]*g_neg[i+w] uses argmax to
+                    #    find the coarse center → ~0.5px leftward bias
+                    # 2. Sub-pixel refinement uses argmax on narrow windows
+                    #    around the coarse positions → another ~0.5px leftward
+                    #
+                    # Total: ~1.0px at work resolution. Verified empirically by
+                    # running detection on a horizontally flipped copy of the
+                    # scan — without correction, both original and flipped show
+                    # the same leftward shift (proving it's algorithmic, not
+                    # content-dependent). The +1.0 correction zeroes out the
+                    # original/flipped asymmetry.
+                    left_t = left_f + 1.0 - (n_pts - 1) / 2
+                    right_t = right_f + 1.0 - (n_pts - 1) / 2
+                    left_edges.append(left_t)
+                    right_edges.append(right_t)
 
         if left_edges and right_edges:
             # Median to reject sprocket-hole outliers
-            left_edge = float(np.median(left_edges))
-            right_edge = float(np.median(right_edges))
-            cross_w = right_edge - left_edge
-            cross_cx = (left_edge + right_edge) / 2
+            left_offset = float(np.median(left_edges))
+            right_offset = float(np.median(right_edges))
+            cross_w = right_offset - left_offset
+            cross_center_offset = (left_offset + right_offset) / 2
 
             if cross_w > 0:
+                # Shift frame center in the cross direction
                 if is_vert:
-                    frames[i, 0] = cross_cx
+                    frames[i, 0] = cx + cross_center_offset * cos_a
                     frames[i, 2] = cross_w
                 else:
-                    frames[i, 1] = cross_cx
+                    frames[i, 1] = cy + cross_center_offset * cos_a
                     frames[i, 3] = cross_w
-                print(f"  Frame {i+1} cross edges: {left_edge:.1f} - {right_edge:.1f} "
+                print(f"  Frame {i+1} cross edges: {left_offset:.1f} to {right_offset:.1f} "
                       f"(w={cross_w:.1f})")
 
     # Scale from work resolution back to full preview coords
