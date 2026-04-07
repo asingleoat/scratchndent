@@ -556,6 +556,14 @@ img.onload = () => {
     render();
     overlay.style.display = 'none';
 };
+img.onerror = () => {
+    // If preview load fails (e.g. broken pipe), retry after a short delay
+    skipFitOnLoad = false;
+    setTimeout(() => {
+        console.warn('Preview load failed, retrying...');
+        img.src = img.src;  // retry same URL
+    }, 500);
+};
 
 function fitImage() {
     const ww = wrap.clientWidth, wh = wrap.clientHeight;

@@ -70,7 +70,7 @@ PARAM_DEFAULTS = {
     "color_tint": 0.0,
 
     # UI / preview
-    "preview_size": 0,          # 0 = unlimited (native resolution)
+    "preview_size": 8192,       # max dimension for preview source data
     "clahe_clip": 2.0,
 }
 
@@ -713,11 +713,16 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/preview":
             self._respond(200, "image/jpeg", PREVIEW_JPEG)
         elif parsed.path == "/preview/inverted":
-            jpeg = render_inverted_preview()
+            try:
+                jpeg = render_inverted_preview()
+            except Exception as e:
+                print(f"  ERROR in render_inverted_preview: {e}")
+                jpeg = None
             if jpeg:
                 self._respond(200, "image/jpeg", jpeg)
             else:
-                # Fall back to the CLAHE preview
+                if not get_active_stock():
+                    print("  No film stock selected — falling back to CLAHE preview")
                 self._respond(200, "image/jpeg", PREVIEW_JPEG)
         elif parsed.path == "/info":
             info = {
@@ -953,11 +958,14 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(500, "text/plain", str(e).encode())
 
     def _respond(self, code, content_type, data):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except BrokenPipeError:
+            pass  # client disconnected before response finished
 
 
 def _apply_rotation(img: np.ndarray, rotation: int) -> np.ndarray:
