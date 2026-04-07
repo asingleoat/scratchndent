@@ -118,6 +118,8 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <label title="Export inverted positive without IR cleaning"><input type="checkbox" id="chk-inv-only"> Inverted only</label>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <span id="dmin-display" style="font-size:11px;color:#888"></span>
+    <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
+    <label title="Show live inversion preview instead of simple negative view"><input type="checkbox" id="chk-inv-preview"> Preview inversion</label>
     <span style="flex:1"></span>
     <label>Base name:</label>
     <input id="basename" value="" style="width:100px">
@@ -179,6 +181,20 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
             <div class="param-ctrl">
                 <input type="range" data-param="exposure_compensation" min="-0.5" max="2.0" step="0.05">
                 <span class="param-val"></span>
+            </div>
+        </div>
+        <div class="param-row" title="Drag the point to adjust color balance. Horizontal = temperature (blue↔yellow), Vertical = tint (green↔magenta). Center = neutral.">
+            <label>Color balance</label>
+            <div style="position:relative;width:100%;height:120px;background:linear-gradient(to bottom,#4a2,#888,#a4a);border-radius:4px;cursor:crosshair;margin-top:2px" id="color-pad">
+                <div style="position:absolute;top:0;left:0;right:0;bottom:0;background:linear-gradient(to right,rgba(40,80,200,0.5),transparent 50%,rgba(200,180,40,0.5));border-radius:4px"></div>
+                <div id="color-dot" style="position:absolute;width:10px;height:10px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 3px rgba(0,0,0,0.5);pointer-events:none;transform:translate(-50%,-50%)"></div>
+                <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(255,255,255,0.15)"></div>
+                <div style="position:absolute;top:50%;left:0;right:0;height:1px;background:rgba(255,255,255,0.15)"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;margin-top:2px">
+                <span>cool</span>
+                <span id="color-val">0.00, 0.00</span>
+                <span>warm</span>
             </div>
         </div>
     </details>
@@ -315,6 +331,8 @@ const PARAM_DEFAULTS = {
     inpaint_padding: 16, render_contrast: 1.4, render_curve_k: 5.0,
     render_percentile_lo: 0.5, render_percentile_hi: 99.5,
     exposure_compensation: 0.0,
+    color_temp: 0.0,
+    color_tint: 0.0,
 };
 
 function fmtVal(v, step) {
@@ -351,6 +369,8 @@ stockSelect.addEventListener('change', () => {
             body: JSON.stringify({ export_ir_inv: true }),
         });
     }
+    // Refresh inversion preview after stock change
+    setTimeout(() => refreshInversionPreview(), 200);
 });
 
 function initParamSliders(cfg) {
@@ -387,12 +407,91 @@ function initParamSliders(cfg) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ [key]: v }),
-            });
+            }).then(() => refreshInversionPreview());
         });
     });
 }
 
+// --- Live inversion preview ---
+const chkInvPreview = document.getElementById('chk-inv-preview');
+let invPreviewPending = false;
+
+function refreshInversionPreview() {
+    if (!chkInvPreview.checked) return;
+    if (invPreviewPending) return;  // debounce
+    invPreviewPending = true;
+    setTimeout(() => {
+        skipFitOnLoad = true;
+        img.src = '/preview/inverted?' + Date.now();
+        invPreviewPending = false;
+    }, 100);
+}
+
+chkInvPreview.addEventListener('change', () => {
+    skipFitOnLoad = true;
+    if (chkInvPreview.checked) {
+        img.src = '/preview/inverted?' + Date.now();
+    } else {
+        img.src = '/preview?' + Date.now();
+    }
+});
+
+// --- Color balance pad ---
+const colorPad = document.getElementById('color-pad');
+const colorDot = document.getElementById('color-dot');
+const colorVal = document.getElementById('color-val');
+let colorTemp = 0, colorTint = 0;
+let colorDragging = false;
+
+function updateColorDot() {
+    const rect = colorPad.getBoundingClientRect();
+    // temp: -1 (left/cool) to +1 (right/warm)
+    // tint: -1 (top/green) to +1 (bottom/magenta)
+    const px = (colorTemp + 1) / 2 * rect.width;
+    const py = (colorTint + 1) / 2 * rect.height;
+    colorDot.style.left = px + 'px';
+    colorDot.style.top = py + 'px';
+    colorVal.textContent = `${colorTemp.toFixed(2)}, ${colorTint.toFixed(2)}`;
+}
+
+function colorPadFromMouse(e) {
+    const rect = colorPad.getBoundingClientRect();
+    colorTemp = Math.max(-1, Math.min(1, ((e.clientX - rect.left) / rect.width) * 2 - 1));
+    colorTint = Math.max(-1, Math.min(1, ((e.clientY - rect.top) / rect.height) * 2 - 1));
+    updateColorDot();
+}
+
+function saveColorBalance() {
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ color_temp: colorTemp, color_tint: colorTint }),
+    }).then(() => refreshInversionPreview());
+}
+
+colorPad.addEventListener('mousedown', (e) => {
+    colorDragging = true;
+    colorPadFromMouse(e);
+    e.preventDefault();
+});
+window.addEventListener('mousemove', (e) => {
+    if (colorDragging) { colorPadFromMouse(e); }
+});
+window.addEventListener('mouseup', () => {
+    if (colorDragging) { colorDragging = false; saveColorBalance(); }
+});
+// Double-click to reset
+colorPad.addEventListener('dblclick', () => {
+    colorTemp = 0; colorTint = 0;
+    updateColorDot();
+    saveColorBalance();
+});
+
 fetch('/settings').then(r => r.json()).then(cfg => {
+    // Initialize color pad from config
+    colorTemp = cfg.color_temp || 0;
+    colorTint = cfg.color_tint || 0;
+    updateColorDot();
     if (cfg.aspect) {
         document.getElementById('aspect').value = cfg.aspect;
     }
@@ -449,10 +548,11 @@ async function switchImage(idx) {
     // img.onload will call fitImage + render, then hide overlay
 }
 
-const origOnload = img.onload;
+let skipFitOnLoad = false;
 img.onload = () => {
     imgW = img.width; imgH = img.height;
-    fitImage();
+    if (!skipFitOnLoad) fitImage();
+    skipFitOnLoad = false;
     render();
     overlay.style.display = 'none';
 };
@@ -818,6 +918,7 @@ canvas.addEventListener('mouseup', () => {
                 }),
             }).then(r => r.json()).then(data => {
                 updateDminDisplay(data.dmin || null);
+                refreshInversionPreview();
             });
         } else {
             rebateRect = null;

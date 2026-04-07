@@ -96,6 +96,8 @@ def render_to_display(
     percentile_lo: float = 0.5,
     percentile_hi: float = 99.5,
     exposure_compensation: float = 0.0,
+    color_temp: float = 0.0,
+    color_tint: float = 0.0,
 ) -> np.ndarray:
     """Render corrected density values to display-ready sRGB uint16.
 
@@ -140,6 +142,27 @@ def render_to_display(
     # Normalize to [0, 1]
     display = (img - lo) / (hi - lo)
     display = np.clip(display, 0.0, 1.0)
+
+    # Color balance: temperature (blue↔yellow) and tint (green↔magenta)
+    # Applied as brightness-preserving channel adjustments.
+    # temp > 0 = warmer (more yellow), temp < 0 = cooler (more blue)
+    # tint > 0 = more magenta, tint < 0 = more green
+    if abs(color_temp) > 0.001 or abs(color_tint) > 0.001:
+        # Convert temp/tint to per-channel multipliers that preserve luminance
+        # Temperature shifts R and B in opposite directions
+        # Tint shifts G relative to R+B
+        r_mul = 1.0 + color_temp * 0.5
+        b_mul = 1.0 - color_temp * 0.5
+        g_mul = 1.0 - color_tint * 0.5
+        # Normalize to preserve perceived brightness (Rec.709 luminance)
+        lum_scale = 0.2126 * r_mul + 0.7152 * g_mul + 0.0722 * b_mul
+        r_mul /= lum_scale
+        g_mul /= lum_scale
+        b_mul /= lum_scale
+        display[:, :, 0] *= r_mul
+        display[:, :, 1] *= g_mul
+        display[:, :, 2] *= b_mul
+        display = np.clip(display, 0.0, None)
 
     # Exposure compensation: applied after normalization as a power curve.
     # Positive values brighten (gamma < 1), negative darken (gamma > 1).

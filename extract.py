@@ -65,12 +65,12 @@ PARAM_DEFAULTS = {
     "render_curve_k": 5.0,
     "render_percentile_lo": 0.5,
     "render_percentile_hi": 99.5,
-
-    # Film inversion
     "exposure_compensation": 0.0,
+    "color_temp": 0.0,
+    "color_tint": 0.0,
 
     # UI / preview
-    "preview_size": 2400,
+    "preview_size": 0,          # 0 = unlimited (native resolution)
     "clahe_clip": 2.0,
 }
 
@@ -102,6 +102,8 @@ PARAM_COMMENTS = {
     "render_percentile_lo": "Low percentile for display range normalization (default 0.5)",
     "render_percentile_hi": "High percentile for display range normalization (default 99.5)",
     "exposure_compensation": "Density-domain exposure shift: positive = brighter output (default 0.0)",
+    "color_temp": "Color temperature: positive = warmer/yellow, negative = cooler/blue (default 0.0)",
+    "color_tint": "Color tint: positive = magenta, negative = green (default 0.0)",
     "clahe_clip": "CLAHE clip limit for preview contrast enhancement (default 2.0)",
     "dmin": "Film base density [R, G, B] — set via rebate selection in the UI",
     "ir_clean": "Enable IR dust/scratch removal (true/false)",
@@ -123,7 +125,9 @@ PARAM_SECTIONS = {
     "render_curve_k": "render",
     "render_percentile_lo": "render",
     "render_percentile_hi": "render",
-    "exposure_compensation": "inversion",
+    "exposure_compensation": "render",
+    "color_temp": "render",
+    "color_tint": "render",
 }
 
 # Built-in film stock definitions. Each maps to polynomial coefficients (10x3).
@@ -340,6 +344,8 @@ FULL_IMG_READY: bool = False              # True once full-res load + alignment 
 DMIN: np.ndarray | None = None            # per-channel Dmin from full strip
 PREVIEW_JPEG: bytes = b""                # downscaled JPEG for the browser
 PREVIEW_SCALE: float = 1.0               # preview pixels / full pixels
+PREVIEW_RAW: np.ndarray | None = None    # downscaled raw uint16 for live inversion
+PREVIEW_SCENE_LINEAR: np.ndarray | None = None  # cached inverted density (for re-render)
 FULL_WIDTH: int = 0                       # full-res dimensions (from raw load)
 FULL_HEIGHT: int = 0
 IMAGE_LIST: list[str] = []               # all image paths in folder
@@ -398,6 +404,8 @@ def apply_inversion(img: np.ndarray) -> np.ndarray:
         percentile_lo=get_param("render_percentile_lo"),
         percentile_hi=get_param("render_percentile_hi"),
         exposure_compensation=get_param("exposure_compensation"),
+        color_temp=get_param("color_temp"),
+        color_tint=get_param("color_tint"),
     )
 
 
@@ -490,6 +498,7 @@ def switch_to_image(idx: int) -> None:
     """Load image, generate preview at reduced resolution for speed."""
     global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
     global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, CURRENT_DPI
+    global PREVIEW_RAW, PREVIEW_SCENE_LINEAR
     LOADING = True
     FULL_IMG = None
     FULL_IR = None
@@ -510,15 +519,19 @@ def switch_to_image(idx: int) -> None:
     print(f"  Image: {w}x{h}, {rgb.dtype}{dpi_str}")
 
     # Downscale for preview
-    preview_scale = min(get_preview_size() / max(h, w), 1.0)
+    ps = get_preview_size()
+    preview_scale = min(ps / max(h, w), 1.0) if ps > 0 else 1.0
     if preview_scale < 1.0:
         pw, ph = int(w * preview_scale), int(h * preview_scale)
         small_rgb = cv2.resize(rgb, (pw, ph), interpolation=cv2.INTER_AREA)
     else:
         small_rgb = rgb
 
-    # Preview just needs to be usable for identifying frames and selecting
-    # rebate — not a proper inversion. Simple invert + histogram equalization.
+    # Cache the raw downscaled image for live inversion preview
+    PREVIEW_RAW = small_rgb.copy() if small_rgb.dtype == np.uint16 else (small_rgb.astype(np.uint16) * 257)
+    PREVIEW_SCENE_LINEAR = None
+
+    # Quick preview: simple invert + CLAHE for frame identification
     print("  Generating quick preview...")
     if small_rgb.dtype == np.uint16:
         preview8 = (small_rgb >> 8).astype(np.uint8)
@@ -554,6 +567,60 @@ def switch_to_image(idx: int) -> None:
 
     print(f"  Preview ready ({preview8.shape[1]}x{preview8.shape[0]}, scale={preview_scale:.4f})")
     LOADING = False
+
+
+def render_inverted_preview() -> bytes | None:
+    """Render the preview through the inversion pipeline with current settings.
+
+    Returns JPEG bytes, or None if inversion isn't configured.
+    Caches the scene-linear intermediate so re-renders (param changes) are fast.
+    """
+    global PREVIEW_SCENE_LINEAR
+
+    stock = get_active_stock()
+    if not stock or PREVIEW_RAW is None:
+        return None
+
+    # Recompute scene-linear if not cached (stock or Dmin changed)
+    if PREVIEW_SCENE_LINEAR is None:
+        t = time.monotonic()
+        coeffs = get_stock_coeffs(stock)
+        PREVIEW_SCENE_LINEAR = invert_negative(
+            PREVIEW_RAW,
+            dmin=DMIN,
+            coeffs=coeffs,
+        )
+        print(f"  Inversion preview computed in {time.monotonic()-t:.2f}s")
+
+    # Render with current params (fast — just normalization + S-curve)
+    t = time.monotonic()
+    display = render_to_display(
+        PREVIEW_SCENE_LINEAR,
+        contrast=get_param("render_contrast"),
+        curve_k=get_param("render_curve_k"),
+        percentile_lo=get_param("render_percentile_lo"),
+        percentile_hi=get_param("render_percentile_hi"),
+        exposure_compensation=get_param("exposure_compensation"),
+        color_temp=get_param("color_temp"),
+        color_tint=get_param("color_tint"),
+    )
+    print(f"  Render preview in {time.monotonic()-t:.2f}s")
+
+    # Convert to JPEG
+    if display.dtype == np.uint16:
+        display8 = (display >> 8).astype(np.uint8)
+    else:
+        display8 = display
+    pil_img = Image.fromarray(display8)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def invalidate_inversion_cache():
+    """Clear cached scene-linear when stock or Dmin changes."""
+    global PREVIEW_SCENE_LINEAR
+    PREVIEW_SCENE_LINEAR = None
 
 
 def load_image(path: str) -> tuple[np.ndarray, np.ndarray | None]:
@@ -645,6 +712,13 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, "text/html", get_html().encode())
         elif parsed.path == "/preview":
             self._respond(200, "image/jpeg", PREVIEW_JPEG)
+        elif parsed.path == "/preview/inverted":
+            jpeg = render_inverted_preview()
+            if jpeg:
+                self._respond(200, "image/jpeg", jpeg)
+            else:
+                # Fall back to the CLAHE preview
+                self._respond(200, "image/jpeg", PREVIEW_JPEG)
         elif parsed.path == "/info":
             info = {
                 "full_width": FULL_WIDTH,
@@ -748,6 +822,7 @@ class Handler(BaseHTTPRequestHandler):
                         rebate_rgb = full[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]].copy()
                         del full
                 DMIN = compute_dmin(rebate_rgb)
+                invalidate_inversion_cache()
                 print(f"  Dmin updated: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
                 save_config({"dmin": DMIN.tolist()})
             self._respond(200, "application/json",
@@ -756,6 +831,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
             save_config(body)
+            # Invalidate inversion cache if stock changed
+            if "stock" in body:
+                invalidate_inversion_cache()
             self._respond(200, "application/json",
                           json.dumps({"ok": True}).encode())
         elif self.path == "/scan/trash":
@@ -966,6 +1044,8 @@ def _process_frame(
             percentile_lo=get_param("render_percentile_lo"),
             percentile_hi=get_param("render_percentile_hi"),
             exposure_compensation=get_param("exposure_compensation"),
+            color_temp=get_param("color_temp"),
+            color_tint=get_param("color_tint"),
         )
         return result, time.monotonic() - t
 
