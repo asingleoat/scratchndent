@@ -529,7 +529,11 @@ def switch_to_image(idx: int) -> None:
         small_rgb = rgb
 
     # Cache the raw downscaled image for live inversion preview
-    PREVIEW_RAW = small_rgb.copy() if small_rgb.dtype == np.uint16 else (small_rgb.astype(np.uint16) * 257)
+    # Cache raw preview for inversion — ensure 3-channel uint16
+    raw = small_rgb
+    if raw.ndim == 2:
+        raw = cv2.cvtColor(raw, cv2.COLOR_GRAY2RGB)
+    PREVIEW_RAW = raw.copy() if raw.dtype == np.uint16 else (raw.astype(np.uint16) * 257)
     PREVIEW_SCENE_LINEAR = None
 
     # Quick preview: simple invert + CLAHE for frame identification
@@ -538,6 +542,9 @@ def switch_to_image(idx: int) -> None:
         preview8 = (small_rgb >> 8).astype(np.uint8)
     else:
         preview8 = small_rgb
+    # Handle grayscale (IR-only) scans — convert to 3-channel for display
+    if preview8.ndim == 2:
+        preview8 = cv2.cvtColor(preview8, cv2.COLOR_GRAY2RGB)
     # Mask out sprocket holes before inversion — they're near-white in the
     # raw scan (full scanner light, no film) and would become black after
     # inversion, skewing the contrast stretch.
