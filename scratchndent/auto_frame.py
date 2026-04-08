@@ -564,6 +564,36 @@ def detect_frames(
             snapped.append(max(int(min_pos), pos))
     edge_obs_positions = snapped
 
+    # Fix last frame's trailing edge using paired product.
+    # The first N-1 frames give us a reliable expected dimension. The last
+    # frame's trailing edge is vulnerable to hitting the image boundary
+    # (which produces a strong false gradient). Use the paired product
+    # of the gradient at (start, start+expected_dim) to find the correct
+    # trailing edge, same approach as cross-strip detection.
+    if actual_n >= 2 and len(edge_obs_positions) == 2 * actual_n:
+        # Median frame dimension from the first N-1 frames
+        dims = [edge_obs_positions[2*i+1] - edge_obs_positions[2*i]
+                for i in range(actual_n - 1)]
+        expected_dim = int(np.median(dims))
+
+        last_start = edge_obs_positions[-2]
+        search_lo = max(0, last_start + expected_dim - snap_radius)
+        search_hi = min(len(grad_avg), last_start + expected_dim + snap_radius + 1)
+
+        if search_hi > search_lo:
+            # Score each candidate end position by gradient strength
+            # weighted by proximity to the expected dimension. This
+            # strongly biases toward edges that produce a frame length
+            # consistent with the other frames.
+            candidates = grad_avg[search_lo:search_hi].copy()
+            expected_pos = last_start + expected_dim
+            for j in range(len(candidates)):
+                dist = abs((search_lo + j) - expected_pos)
+                # Gaussian weighting: sigma = 2% of expected_dim
+                sigma = expected_dim * 0.02
+                candidates[j] *= math.exp(-0.5 * (dist / sigma) ** 2)
+            best_end = search_lo + int(np.argmax(candidates))
+            edge_obs_positions[-1] = best_end
 
     # Place frames from edge pairs, enforcing aspect ratio
     target_aspect = work_info["frame_w"] / max(work_info["frame_h"], 1)

@@ -7,9 +7,9 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
 #toolbar {
-    position: fixed; top: 0; left: 0; right: 0; height: 48px; z-index: 100;
-    background: #2a2a2a; display: flex; align-items: center; padding: 0 16px; gap: 12px;
-    border-bottom: 1px solid #444;
+    position: fixed; top: 0; left: 0; right: 0; min-height: 48px; z-index: 100;
+    background: #2a2a2a; display: flex; align-items: center; padding: 4px 16px; gap: 8px 12px;
+    border-bottom: 1px solid #444; flex-wrap: wrap;
 }
 #toolbar label { font-size: 13px; color: #aaa; }
 #toolbar select, #toolbar button, #toolbar input {
@@ -287,10 +287,15 @@ const HANDLE_SIZE = 8;
 const ROT_HANDLE_DIST = 30;
 
 // --- Image loading ---
+let initialLoad = true;
 img.onload = () => {
     imgW = img.width; imgH = img.height;
     fitImage();
     render();
+    if (initialLoad) {
+        initialLoad = false;
+        runAutoDetect();
+    }
 };
 img.src = '/preview';
 let imageIdx = 0, imageCount = 1;
@@ -531,19 +536,9 @@ fetch('/info').then(r => r.json()).then(updateImageInfo);
 
 async function switchImage(idx) {
     overlay.style.display = 'flex';
-    // Save current selections for carry-over to next image
-    if (selections.length > 0 && !selectionsAreInherited) {
-        previousSelections = selections.map(s => ({...s}));
-    }
-    // Restore previous selections (user can modify or clear them)
-    if (previousSelections.length > 0) {
-        selections = previousSelections.map(s => ({...s}));
-        activeIdx = 0;
-        selectionsAreInherited = true;
-    } else {
-        selections = [];
-        activeIdx = -1;
-    }
+    selections = [];
+    activeIdx = -1;
+    lastAutoFrames = null;
     rebateRect = null;
     updateSelList();
     const resp = await fetch('/switch', {
@@ -556,6 +551,8 @@ async function switchImage(idx) {
     // Reload preview (cache-bust)
     img.src = '/preview?' + Date.now();
     // img.onload will call fitImage + render, then hide overlay
+    // Auto-detect frames on the new image
+    img.addEventListener('load', () => { runAutoDetect(); }, { once: true });
 }
 
 let skipFitOnLoad = false;
@@ -618,12 +615,9 @@ function getAspect() {
 // --- Selection model ---
 let lastAngle = 0, lastW = 0, lastH = 0;
 let lastRotation = 270; // default: 270° CW (scanner vertical, photos landscape)
-let previousSelections = []; // saved from last image for carry-over
 let lastAutoFrames = null;   // last auto-detected frames (unscaled) for rescaling
-let selectionsAreInherited = false; // true if current selections came from previous image
 
 function addSelection(x, y, w, h, angle = lastAngle) {
-    selectionsAreInherited = false; // user is making manual selections
     selections.push({ x, y, w, h, angle, rotation: lastRotation });
     activeIdx = selections.length - 1;
     updateSelList();
@@ -810,7 +804,6 @@ canvas.addEventListener('mousedown', (e) => {
     const hit = hitTest(mx, my);
 
     if (hit) {
-        selectionsAreInherited = false; // user is interacting with selections
         activeIdx = hit.idx;
         const s = selections[hit.idx];
         if (hit.type === 'move') {
@@ -1056,7 +1049,7 @@ document.getElementById('btn-scan-delete').addEventListener('click', async () =>
     }
 });
 
-document.getElementById('btn-auto').addEventListener('click', async () => {
+async function runAutoDetect() {
     const fmt = document.getElementById('auto-format').value;
     statusEl.textContent = 'Detecting frames...';
     try {
@@ -1067,7 +1060,6 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
         });
         const data = await resp.json();
         if (data.ok && data.frames) {
-            selectionsAreInherited = false;
             lastAutoFrames = data.frames;
             const scalePct = parseFloat(document.getElementById('auto-scale').value) || 0;
             const s = 1 + scalePct / 100;
@@ -1106,7 +1098,9 @@ document.getElementById('btn-auto').addEventListener('click', async () => {
     } catch (e) {
         statusEl.textContent = 'Auto-detect error: ' + e.message;
     }
-});
+}
+
+document.getElementById('btn-auto').addEventListener('click', runAutoDetect);
 
 document.getElementById('auto-scale').addEventListener('input', () => {
     if (!lastAutoFrames) return;
@@ -1127,7 +1121,6 @@ document.getElementById('auto-scale').addEventListener('input', () => {
 
 
 document.getElementById('btn-clear').addEventListener('click', () => {
-    selectionsAreInherited = false;
     selections = []; activeIdx = -1; updateSelList(); render();
 });
 
@@ -1178,13 +1171,20 @@ document.getElementById('btn-export').addEventListener('click', async () => {
 });
 
 // --- Resize handling ---
-window.addEventListener('resize', () => { render(); });
+function adjustLayout() {
+    const tb = document.getElementById('toolbar');
+    const h = tb.offsetHeight + 'px';
+    document.getElementById('sidebar').style.top = h;
+    document.getElementById('canvas-wrap').style.top = h;
+    render();
+}
+window.addEventListener('resize', adjustLayout);
+adjustLayout();
 
 // --- Keyboard ---
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Delete' || e.key === 'Backspace') {
         if (activeIdx >= 0 && document.activeElement.tagName !== 'INPUT') {
-            selectionsAreInherited = false;
             selections.splice(activeIdx, 1);
             activeIdx = Math.min(activeIdx, selections.length - 1);
             updateSelList(); render();
