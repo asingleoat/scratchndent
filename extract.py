@@ -109,6 +109,7 @@ PARAM_COMMENTS = {
     "dmin": "Film base density [R, G, B] — set via rebate selection in the UI",
     "ir_clean": "Enable IR dust/scratch removal (true/false)",
     "invert": "Enable film negative inversion (true/false)",
+    "preview_inversion": "Show inverted preview instead of CLAHE (true/false)",
     "aspect": "Last used aspect ratio for frame selection",
 }
 
@@ -166,11 +167,10 @@ def get_stock_coeffs(name: str) -> np.ndarray:
                      f"Available: {list(stocks.keys())}")
 
 
-def load_config() -> dict:
-    """Load persisted settings from TOML config file.
+def _load_config_from_disk() -> dict:
+    """Load settings from TOML config file on disk.
 
-    Returns a flat dict with parameter sections flattened.
-    Stock definitions are stored under the special key "_stocks".
+    Called once at startup. After that, the in-memory _CONFIG is authoritative.
     """
     if CONFIG_FILE.exists():
         try:
@@ -194,6 +194,16 @@ def load_config() -> dict:
     return {}
 
 
+# In-memory config — loaded once from disk, then updated in place.
+# All getters read from this; save_config updates it and writes to disk.
+_CONFIG: dict = _load_config_from_disk()
+
+
+def load_config() -> dict:
+    """Return the in-memory config (no disk read)."""
+    return _CONFIG
+
+
 def _format_toml_value(v) -> str:
     """Format a Python value as TOML."""
     if isinstance(v, bool):
@@ -207,17 +217,19 @@ def _format_toml_value(v) -> str:
 
 
 def save_config(updates: dict) -> None:
-    """Merge updates into the TOML config file with comments."""
-    cfg = load_config()
-    cfg.update(updates)
+    """Merge updates into in-memory config and persist to disk."""
+    _CONFIG.update(updates)
+    cfg = dict(_CONFIG)  # copy for disk write
 
     # Separate stock definitions from flat params
     stocks = cfg.pop("_stocks", {})
 
     lines = ["# scratchndent configuration", "# Edit values below or uncomment to override defaults", ""]
 
-    # Top-level keys
-    top_keys = ["stock", "preview_size", "dmin", "ir_clean", "invert", "aspect"]
+    # Top-level keys: everything in cfg that isn't in a PARAM_SECTIONS group
+    # or the special _stocks key
+    sectioned_keys = set(PARAM_SECTIONS.keys())
+    top_keys = [k for k in cfg if k not in sectioned_keys and k != "_stocks"]
     for k in top_keys:
         comment = PARAM_COMMENTS.get(k)
         if comment:
@@ -354,6 +366,7 @@ IMAGE_IDX: int = 0                        # current index into IMAGE_LIST
 IR_CLEAN: bool = True                     # auto-detect by default
 LOADING: bool = False                     # True while switching images
 HAS_IR: bool = False                      # whether current image has IR channel
+IS_GRAYSCALE: bool = False                # whether current image is monochrome (e.g. IR-only scan)
 PROGRESS: str = ""                        # current export/processing status for GUI
 REBATE_RECT: dict | None = None           # {x, y, w, h} in full-res coords
 
@@ -498,7 +511,7 @@ def ir_clean_region(
 def switch_to_image(idx: int) -> None:
     """Load image, generate preview at reduced resolution for speed."""
     global INPUT_PATH, FULL_IMG, FULL_IMG_READY, PREVIEW_JPEG, PREVIEW_SCALE
-    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, CURRENT_DPI
+    global IMAGE_IDX, LOADING, FULL_WIDTH, FULL_HEIGHT, HAS_IR, IS_GRAYSCALE, CURRENT_DPI
     global PREVIEW_RAW, PREVIEW_SCENE_LINEAR
     LOADING = True
     FULL_IMG = None
@@ -516,6 +529,7 @@ def switch_to_image(idx: int) -> None:
     h, w = rgb.shape[:2]
     FULL_WIDTH, FULL_HEIGHT = w, h
     HAS_IR = ir is not None
+    IS_GRAYSCALE = rgb.ndim == 2
     dpi_str = f", {CURRENT_DPI} DPI (scale {get_dpi_scale():.1f}x)" if CURRENT_DPI else ""
     print(f"  Image: {w}x{h}, {rgb.dtype}{dpi_str}")
 
@@ -586,7 +600,7 @@ def render_inverted_preview() -> bytes | None:
     global PREVIEW_SCENE_LINEAR
 
     stock = get_active_stock()
-    if not stock or PREVIEW_RAW is None:
+    if not stock or PREVIEW_RAW is None or IS_GRAYSCALE:
         return None
 
     # Recompute scene-linear if not cached (stock or Dmin changed)

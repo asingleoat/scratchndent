@@ -83,6 +83,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <button id="btn-next" title="Next image">&rarr;</button>
     <button id="btn-scan-trash" title="Move current scan to trash">Trash</button>
     <button id="btn-scan-delete" title="Permanently delete current scan" style="color:#d44">Delete</button>
+    <span id="img-info" style="font-size:11px;color:#888"></span>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label>Aspect:</label>
     <select id="aspect">
@@ -292,12 +293,9 @@ img.onload = () => {
     imgW = img.width; imgH = img.height;
     fitImage();
     render();
-    if (initialLoad) {
-        initialLoad = false;
-        runAutoDetect();
-    }
 };
-img.src = '/preview';
+// Initial preview load is deferred to settings callback below
+// so we know whether preview_inversion is enabled.
 let imageIdx = 0, imageCount = 1;
 const imgSelect = document.getElementById('img-select');
 const basenameEl = document.getElementById('basename');
@@ -449,6 +447,11 @@ chkInvPreview.addEventListener('change', () => {
     } else {
         img.src = '/preview?' + Date.now();
     }
+    fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preview_inversion: chkInvPreview.checked }),
+    });
 });
 
 // --- Color balance pad ---
@@ -516,8 +519,12 @@ fetch('/settings').then(r => r.json()).then(cfg => {
         document.getElementById('chk-ir-inv').checked = cfg.export_ir_inv;
     if (cfg.export_inv_only !== undefined)
         document.getElementById('chk-inv-only').checked = cfg.export_inv_only;
+    if (cfg.preview_inversion !== undefined)
+        chkInvPreview.checked = cfg.preview_inversion;
     updateDminDisplay(cfg.dmin || null);
     initParamSliders(cfg);
+    // Load initial preview now that we know checkbox state
+    img.src = (chkInvPreview.checked ? '/preview/inverted' : '/preview');
 });
 
 function updateImageInfo(info) {
@@ -527,6 +534,8 @@ function updateImageInfo(info) {
     const name = info.filename || '';
     imgSelect.value = imageIdx;
     basenameEl.value = name.replace(/\.[^.]+$/, '');
+    const mp = (info.full_width * info.full_height / 1e6).toFixed(1);
+    document.getElementById('img-info').textContent = `${info.full_width}x${info.full_height} (${mp}MP)`;
     statusEl.textContent = `${name} | ${info.full_width}x${info.full_height} | Preview scale: ${previewScale.toFixed(3)}`;
     document.getElementById('btn-prev').disabled = false;
     document.getElementById('btn-next').disabled = false;
@@ -548,8 +557,9 @@ async function switchImage(idx) {
     });
     const info = await resp.json();
     updateImageInfo(info);
-    // Reload preview (cache-bust)
-    img.src = '/preview?' + Date.now();
+    // Reload preview (cache-bust), respecting inversion toggle
+    const previewUrl = chkInvPreview.checked ? '/preview/inverted' : '/preview';
+    img.src = previewUrl + '?' + Date.now();
     // img.onload will call fitImage + render, then hide overlay
     // Auto-detect frames on the new image
     img.addEventListener('load', () => { runAutoDetect(); }, { once: true });
@@ -562,6 +572,10 @@ img.onload = () => {
     skipFitOnLoad = false;
     render();
     overlay.style.display = 'none';
+    if (initialLoad) {
+        initialLoad = false;
+        runAutoDetect();
+    }
 };
 img.onerror = () => {
     // If preview load fails (e.g. broken pipe), retry after a short delay
