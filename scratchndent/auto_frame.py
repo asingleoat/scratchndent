@@ -368,7 +368,11 @@ def detect_frames(
     print(f"  Auto-detect: {format_name}, "
           f"{'vertical' if strip_info['is_vertical'] else 'horizontal'} strip, "
           f"{actual_n} frames, "
-          f"frame {strip_info['frame_w']:.0f}x{strip_info['frame_h']:.0f}px")
+          f"frame {float(strip_info['frame_w']):.0f}x{float(strip_info['frame_h']):.0f}px")
+
+    import time as _time
+    t_total = _time.monotonic()
+    _t = _time.monotonic()
 
     # Convert to grayscale 8-bit, invert, and contrast-stretch.
     # On a raw negative the inter-frame gaps are barely visible under the
@@ -390,7 +394,10 @@ def detect_frames(
     gray = clahe.apply(gray)
 
     # Work at reduced resolution for speed
-    work_size = 1500
+    # Work at full preview resolution — our 1D projection + DTW approach
+    # is fast enough that downsampling isn't needed, and higher resolution
+    # gives better sub-pixel edge and angle detection.
+    work_size = max(img_h, img_w)
     work_scale = min(work_size / max(img_h, img_w), 1.0)
     if work_scale < 1.0:
         gray_small = cv2.resize(gray, (int(img_w * work_scale), int(img_h * work_scale)),
@@ -403,10 +410,12 @@ def detect_frames(
         work_scale = 1.0
 
     sh, sw = gray_small.shape[:2]
+    print(f"  Preprocessing ({_time.monotonic()-_t:.2f}s, work res {sw}x{sh})")
 
+    _t = _time.monotonic()
     # Step 1: Estimate strip orientation
     strip_angle = _estimate_strip_orientation(gray_small)
-    print(f"  Strip angle: {math.degrees(strip_angle):.2f} deg")
+    print(f"  Strip angle: {math.degrees(strip_angle):.2f} deg ({_time.monotonic()-_t:.2f}s)")
 
     # Step 2: Initial placement at work resolution
     work_info = {
@@ -417,6 +426,7 @@ def detect_frames(
     }
     frames = _initial_placement(sh, sw, actual_n, work_info, strip_angle)
 
+    _t = _time.monotonic()
     # Step 3: Compute dual 1D projection profiles (avoiding sprocket holes)
     is_vert = strip_info["is_vertical"]
     prof_a, prof_c, prof_b, cross_prof = _compute_strip_profiles(gray_small, is_vert)
@@ -437,8 +447,23 @@ def detect_frames(
 
     # Average all three for boundary finding (more robust than two)
     grad_avg = (grad_a + grad_b + grad_c) / 3
+    print(f"  Profiles + gradients ({_time.monotonic()-_t:.2f}s)")
 
+    _t = _time.monotonic()
     # Step 4: DTW-based frame boundary alignment.
+    # Downsample the gradient profile for DTW speed (O(n*m*band) is expensive
+    # at full resolution). DTW finds coarse edge positions which are then
+    # refined by snapping to peaks in the full-resolution gradient.
+    dtw_max_len = 2000
+    dtw_scale = min(dtw_max_len / len(grad_avg), 1.0)
+    if dtw_scale < 1.0:
+        grad_avg_dtw = cv2.resize(grad_avg.reshape(1, -1),
+                                  (int(len(grad_avg) * dtw_scale), 1),
+                                  interpolation=cv2.INTER_AREA).ravel()
+    else:
+        grad_avg_dtw = grad_avg
+        dtw_scale = 1.0
+
     #
     # Build a synthetic template of what the gradient profile should look
     # like: [edge, frame_silence, edge, gap_silence, edge, frame_silence, ...]
@@ -448,24 +473,25 @@ def detect_frames(
 
     if is_vert:
         strip_len = sh
-        # Frame dim along strip = the dimension spaced along y
-        # In _initial_placement, frames[i,3] = frame_h, and pitch spaces along y
         frame_strip_dim = work_info["frame_h"]
     else:
         strip_len = sw
         frame_strip_dim = work_info["frame_w"]
 
+    # DTW dimensions are in the downsampled space
+    frame_strip_dim_dtw = frame_strip_dim * dtw_scale
     gap_dim = work_info["pitch_px"] - frame_strip_dim
     if gap_dim < 1:
         gap_dim = frame_strip_dim * 0.05
+    gap_dim_dtw = gap_dim * dtw_scale
 
 
     # Build template: 1D array where 1.0 = expected edge, 0.0 = silence.
     # Use 90% of nominal frame dimension — the actual exposed frame is
     # slightly smaller than the physical gate size, and users typically
     # crop slightly inside the frame border.
-    effective_frame_dim = int(frame_strip_dim * 0.90)
-    effective_gap = int(frame_strip_dim * 0.10 + gap_dim)
+    effective_frame_dim = int(frame_strip_dim_dtw * 0.90)
+    effective_gap = int(frame_strip_dim_dtw * 0.10 + gap_dim_dtw)
     template_parts = []
     for i in range(actual_n):
         template_parts.append(1.0)                                    # frame start edge
@@ -476,7 +502,7 @@ def detect_frames(
     template = np.array(template_parts, dtype=np.float64)
 
     # Normalize both signals to [0, 1]
-    obs = grad_avg.copy()
+    obs = grad_avg_dtw.copy()
     if obs.max() > 0:
         obs = obs / obs.max()
     if template.max() > 0:
@@ -495,7 +521,8 @@ def detect_frames(
     scale_ratio = n_o / n_t
     # Band must be wide enough to accommodate strip margins (frames don't
     # start at the image edge) and variable film advance
-    band = int(max(strip_len * 0.1, frame_strip_dim * 0.5))
+    strip_len_dtw = int(strip_len * dtw_scale)
+    band = int(max(strip_len_dtw * 0.1, frame_strip_dim_dtw * 0.5))
 
     # Subsequence DTW: template can start anywhere in the observation.
     # cost[0, j] = 0 for all j (free start position).
@@ -541,14 +568,15 @@ def detect_frames(
     edge_obs_positions = []
     for ti in edge_template_indices:
         if ti in alignment:
-            edge_obs_positions.append(alignment[ti])
+            pos_dtw = alignment[ti]
         else:
-            # Find nearest aligned index
             nearest = min(alignment.keys(), key=lambda k: abs(k - ti))
-            edge_obs_positions.append(alignment[nearest])
+            pos_dtw = alignment[nearest]
+        # Scale back to full resolution
+        edge_obs_positions.append(int(round(pos_dtw / dtw_scale)))
 
 
-    # Snap each edge to the nearest strong gradient peak.
+    # Snap each edge to the nearest strong gradient peak (full resolution).
     # Frame-start edges (even indices) search forward-biased.
     # Frame-end edges (odd indices) search backward-biased.
     # This prevents end-of-frame edges from jumping into the next
@@ -616,11 +644,12 @@ def detect_frames(
                 frames[i, 1] = cross_center
                 frames[i, 2] = strip_dim
                 frames[i, 3] = cross_dim_frame
-        print(f"  Frames placed via DTW alignment")
+        print(f"  Frames placed via DTW alignment ({_time.monotonic()-_t:.2f}s)")
     else:
         print(f"  DTW produced {len(edge_obs_positions)} edges, expected {2*actual_n}, "
-              f"using initial placement")
+              f"using initial placement ({_time.monotonic()-_t:.2f}s)")
 
+    _t = _time.monotonic()
     # Per-frame angle estimation using many narrow projection strips.
     # Sample 10 strips evenly across the safe zone (25%-75% of strip width)
     # to get robust statistics. Each strip produces a gradient profile;
@@ -687,6 +716,9 @@ def detect_frames(
                 angle = max(-max_angle, min(max_angle, angle))
                 frames[i, 4] = angle
 
+    print(f"  Angle estimation ({_time.monotonic()-_t:.2f}s)")
+
+    _t = _time.monotonic()
     # Per-frame cross-strip edge detection.
     # Uses the non-CLAHE inverted image to avoid tile-boundary artifacts
     # that bias edge positions. CLAHE is great for finding inter-frame gaps
@@ -885,7 +917,9 @@ def detect_frames(
 
     # Return profiles for debug visualization, scaled to full preview coords.
     # These are the work-resolution profiles — scale positions to match preview.
-    print(f"  Detected {len(result_frames)} frames (aspect {aspect_str})")
+    print(f"  Cross-strip edges ({_time.monotonic()-_t:.2f}s)")
+    print(f"  Detected {len(result_frames)} frames (aspect {aspect_str}) "
+          f"in {_time.monotonic()-t_total:.2f}s total")
     return {
         "frames": result_frames,
         "aspect": aspect_str,
