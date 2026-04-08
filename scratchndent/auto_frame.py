@@ -605,8 +605,8 @@ def detect_frames(
             e_end = edge_obs_positions[2 * i + 1]
             strip_center = (e_start + e_end) / 2
             strip_dim = e_end - e_start
-            # Compute cross-strip dimension from aspect ratio
-            cross_dim_frame = strip_dim * target_aspect
+            # Cross dimension is always the narrow side of the frame
+            cross_dim_frame = strip_dim * min(fmt["frame_mm"]) / max(fmt["frame_mm"])
             if is_vert:
                 frames[i, 0] = cross_center  # cx centered on strip
                 frames[i, 1] = strip_center  # cy from DTW
@@ -717,8 +717,11 @@ def detect_frames(
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
         strip_dim = frames[i, 3] if is_vert else frames[i, 2]
-        # Derive expected cross width from detected strip dimension + aspect ratio
-        cross_dim_est = strip_dim * target_aspect
+        # Derive expected cross dimension from detected strip dimension.
+        # The cross dimension is always the narrow side of the frame.
+        narrow_mm = min(fmt["frame_mm"])
+        wide_mm = max(fmt["frame_mm"])
+        cross_dim_est = strip_dim * narrow_mm / wide_mm
 
         # Sample positions along the frame's strip axis (middle 60%)
         margin_frac = 0.2
