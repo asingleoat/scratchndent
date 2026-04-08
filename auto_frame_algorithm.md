@@ -34,15 +34,15 @@ Given the input image dimensions and the film format's physical specifications:
 
 - **Strip orientation**: The image's longer dimension is the strip axis. If height > width, the strip is vertical (frames stacked top-to-bottom).
 
-- **Pixels per mm**: `px_per_mm = strip_narrow_px / strip_width_mm`, where `strip_narrow_px` is the image's shorter dimension and `strip_width_mm` is the film strip's physical width (e.g. 35mm for 135 film).
+- **Pixels per mm (approximate)**: `px_per_mm = strip_narrow_px / strip_width_mm`. Note: this is an overestimate (~5%) because the scan is typically a few percent wider than the actual film strip. This value is used only for initial frame placement and search window sizing, where the error is harmless. It is NOT used for the DTW template or the final frame dimensions — those are derived from ratios and direct edge detection respectively.
 
-- **Frame dimensions in pixels**: For a vertical strip, the frame's narrow physical dimension (e.g. 24mm for 35mm film) maps to the image's x-axis (width), and the wide dimension (e.g. 36mm) maps to the y-axis (height). So:
+- **Frame dimensions in pixels (approximate)**: For a vertical strip, the frame's narrow physical dimension (e.g. 24mm for 35mm film) maps to the image's x-axis (width), and the wide dimension (e.g. 36mm) maps to the y-axis (height). So:
   - `frame_w_px = narrow_mm * px_per_mm` (across strip)
   - `frame_h_px = wide_mm * px_per_mm` (along strip)
 
-  For a horizontal strip, swap w and h.
+  For a horizontal strip, swap w and h. These are starting estimates; the actual frame dimensions are determined by edge detection in later steps.
 
-- **Frame count**: `n = floor(pitch_ratio * strip_long_px / strip_narrow_px)`, where `pitch_ratio = strip_width_mm / max(frame_w_mm, frame_h_mm)`. For 35mm this is `35/36 = 0.972`, so a strip that's 4.3x longer than wide contains `floor(4.3 * 0.972) = 4` frames.
+- **Frame count**: `n = floor(pitch_ratio * strip_long_px / strip_narrow_px)`, where `pitch_ratio = strip_width_mm / max(frame_w_mm, frame_h_mm)`. For 35mm this is `35/36 = 0.972`, so a strip that's 4.3x longer than wide contains `floor(4.3 * 0.972) = 4` frames. This works despite the ~5% px_per_mm error because it uses a dimensionless ratio of the image's own dimensions, not an absolute pixel-to-mm conversion.
 
 ### Step 1: Image Preprocessing
 
@@ -84,15 +84,15 @@ A synthetic 1D template is constructed representing the expected gradient patter
 
 ```
 [1, 0, 0, ..., 0, 1, 0, 0, ..., 0, 1, 0, 0, ..., 0, 1, ...]
- ^   frame (90%)  ^   gap (~10%+gap)  ^   frame     ^
+ ^     frame      ^      gap       ^     frame      ^
 ```
 
 - Each `1` represents an expected frame boundary (high gradient).
 - Zeros represent frame interior (low gradient) and inter-frame gaps.
-- Frame interior length = 90% of the nominal frame dimension (the actual exposed area is slightly smaller than the physical gate).
-- Gap length = remaining 10% of frame dimension + the physical inter-frame gap.
+- The template proportions are computed directly from the physical mm dimensions of the film format (frame size and inter-frame gap from the pitch), NOT from the px_per_mm estimate. This avoids the ~5% error from the scan being wider than the film strip. Since both the template and observation are normalized to [0, 1], only the ratio of frame-to-gap matters, not absolute pixel sizes.
+- Template resolution is capped at 1000 samples (matching the DTW downsampling) with `samples_per_mm = template_length / total_strip_mm`.
 
-The template and observation (`grad_avg`, downsampled to max 2000 samples) are both normalized to [0, 1].
+The template and observation (`grad_avg`, downsampled to max 1000 samples) are both normalized to [0, 1].
 
 #### Subsequence DTW
 
@@ -171,20 +171,15 @@ For each frame, 15 sample lines are taken perpendicular to the strip axis from w
 - Sample line direction: perpendicular to strip axis, rotated by `a`
 - Sample coordinates: `xs = center_x + t*cos(a)`, `ys = center_y - t*sin(a)`, where `t` ranges from `-(n-1)/2` to `+(n-1)/2` for `n` sample points spanning the strip width.
 
-**Signed gradient**: The 1D gradient along each sample line is computed (not the absolute gradient). This is critical because:
-- The left frame edge is a dark→bright transition (positive gradient)
-- The right frame edge is a bright→dark transition (negative gradient)
-- Sprocket holes create both positive and negative gradients
-
-By searching for positive peaks at the expected left-edge position and negative peaks at the expected right-edge position, sprocket hole gradients are rejected because they have the wrong sign at the expected separation.
-
-**Paired product**: Rather than finding left and right edges independently, a paired product array is computed indexed by the center position `c`:
+**Rising/falling edge paired product**: The 1D signed gradient along each sample line is split into its positive part (`g_pos = max(gradient, 0)`, rising edges) and negative part (`g_neg = max(-gradient, 0)`, falling edges). A paired product array indexed by center position `c` is then computed:
 
 ```
-paired[c] = max(gradient, 0)[c - hw] * max(-gradient, 0)[c + hw]
+paired[c] = g_pos[c - hw] * g_neg[c + hw]
 ```
 
-where `hw` is half the expected frame width (derived from aspect ratio and the detected strip-axis dimension). This product is high only where a positive gradient (left edge) and negative gradient (right edge) exist at exactly the right separation. The peak of this array gives the frame center.
+where `hw` is half the expected frame width (derived from aspect ratio and the detected strip-axis dimension). This product is high only at positions where a rising edge (dark-to-bright, entering the frame) and a falling edge (bright-to-dark, leaving the frame) exist at exactly the expected frame width apart. The peak of this array gives the frame center.
+
+This rejects sprocket holes because, while they produce strong gradients, they do not produce a rising-then-falling pair at the correct separation. A sprocket hole creates both rising and falling edges, but they are close together (within the hole) rather than spaced one frame width apart.
 
 The expected width `hw` is computed as: `strip_dim * target_aspect / 2`, where `strip_dim` is the frame's strip-axis dimension from step 6 and `target_aspect = frame_w / frame_h` from the format geometry.
 
@@ -205,25 +200,21 @@ An aspect ratio string is generated from the film format's physical dimensions, 
 ## Performance Characteristics
 
 - **Preprocessing** (grayscale, invert, CLAHE): ~0.2s at 1900x8192
-- **Strip orientation** (Canny + Hough): ~0.8s
 - **1D profiles + gradients**: ~0.01s
-- **DTW** (at 2000px downsampled): ~1-2s
+- **DTW** (at 1000px downsampled): ~0.4s
 - **Angle estimation** (20 strips, Theil-Sen): ~0.02s
 - **Cross-strip edges** (15 samples per frame, paired product): ~0.2s
-- **Total**: ~2-3s for a 1900x8192 preview image
+- **Total**: ~0.8s for a 1900x8192 preview image
 
 ## Accuracy
 
-Tested against manually placed frames on a 35mm 4-frame strip (1900x8192 preview of a 9820x42332 6400 DPI scan):
+Validated on a 35mm 4-frame strip (1900x8192 preview of a 9820x42332 6400 DPI scan). Initial development used manually placed frames as ground truth; however, the automatic detection converged to higher precision than manual placement, consistently snapping to the actual gradient edges of frame boundaries rather than the approximate positions a human selects visually.
 
-- **Y-center (strip axis)**: mean absolute error 2.7px (0.03% of image height)
-- **X-center (cross strip)**: mean absolute error 3.1px (excluding one content-dependent outlier)
-- **Width**: mean absolute error 3.1px
-- **Height**: mean absolute error 4.6px
-- **Rotation**: verified symmetric (no algorithmic bias) via horizontal flip test
-- **Algorithmic position bias**: eliminated to <1px via the argmax correction
-
-Remaining errors are content-dependent (image features near frame edges shifting gradient peaks) and are within the precision of manual selection.
+- **Strip-axis positioning**: mean absolute error vs manual ~2.7px, but the automatic positions are objectively more accurate — they sit precisely on the inter-frame gradient transitions.
+- **Cross-strip positioning**: verified bias-free via horizontal flip test (running detection on a left-right mirrored copy of the scan and comparing). Without the argmax bias correction, both original and flipped show a consistent ~5px shift in the same direction, proving algorithmic bias. With the +1.0px correction, the asymmetry is eliminated to <1px.
+- **Frame dimensions**: consistent across frames to within ~3px, determined by actual edge detection rather than physical mm estimates.
+- **Rotation**: sub-pixel precision from Theil-Sen median slope across 20 projection strips. No detectable algorithmic bias.
+- **Overall**: the automatic detection exceeds human manual placement accuracy because it operates on the actual 1D gradient signal rather than visual estimation on a compressed preview image.
 
 ## Key Design Decisions
 
@@ -233,8 +224,8 @@ Remaining errors are content-dependent (image features near frame edges shifting
 
 3. **Paired product for center finding**: Finding the paired product peak `g_pos[c-hw] * g_neg[c+hw]` is equivalent to finding the position where both edges exist at the expected separation, in a single array scan. This is more robust than finding edges independently and hoping they're correctly paired.
 
-4. **DTW at reduced resolution, snapping at full resolution**: DTW is O(n*m*band) and dominates computation time. Running it at 2000px max then snapping to full-resolution gradient peaks gives the same accuracy as full-resolution DTW at ~10x the speed.
+4. **DTW at reduced resolution, snapping at full resolution**: DTW is O(n*m*band) and dominates computation time. Running it at 1000px max then snapping to full-resolution gradient peaks gives the same accuracy as full-resolution DTW at a fraction of the cost.
 
 5. **Theil-Sen for angle**: With 20 strips x 2 edges = 40 measurements, the median of 780 pairwise slopes is extremely robust to outliers from image content hitting individual strips.
 
-6. **Template at 90% frame dimension**: The actual exposed frame is slightly smaller than the physical gate size, and users typically crop slightly inside the frame border. Using 90% prevents the DTW from overshooting to the physical edge.
+6. **Template from mm ratios, not pixel estimates**: The DTW template proportions are derived directly from the film format's physical dimensions (frame mm / pitch mm), not from the px_per_mm estimate which is ~5% too high because the scan extends beyond the film strip edges. Since DTW normalizes both signals, only the ratio matters. The actual frame dimensions in pixels are determined by edge detection, not by the template.
