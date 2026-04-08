@@ -861,6 +861,11 @@ class Handler(BaseHTTPRequestHandler):
                     # which are the same as the UI's preview coords
                     result = detect_frames(PREVIEW_RAW, fmt,
                                            n_frames=n_override)
+                    for i, f in enumerate(result["frames"]):
+                        fw = f["w"] / PREVIEW_SCALE
+                        fh = f["h"] / PREVIEW_SCALE
+                        print(f"    Frame {i+1}: {fw:.0f}x{fh:.0f}px, "
+                              f"rotation {math.degrees(f['angle']):+.2f} deg")
                     self._respond(200, "application/json",
                                   json.dumps({"ok": True,
                                               "frames": result["frames"],

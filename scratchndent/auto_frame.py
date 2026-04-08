@@ -57,62 +57,6 @@ FORMATS = {
 }
 
 
-def _estimate_strip_orientation(gray: np.ndarray) -> float:
-    """Estimate the dominant angle of the film strip from edge detection.
-
-    Returns angle in radians (small, typically < 5 degrees).
-    """
-    # Edge detection
-    edges = cv2.Canny(gray, 30, 100)
-
-    # Hough lines to find the dominant orientation
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=100,
-                            minLineLength=gray.shape[1] // 4, maxLineGap=20)
-    if lines is None or len(lines) == 0:
-        return 0.0
-
-    # Collect angles of long lines (strip edges are the longest)
-    angles = []
-    lengths = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        length = math.hypot(x2 - x1, y2 - y1)
-        angle = math.atan2(y2 - y1, x2 - x1)
-        angles.append(angle)
-        lengths.append(length)
-
-    # Weighted median angle (weighted by line length)
-    angles = np.array(angles)
-    lengths = np.array(lengths)
-
-    # Cluster angles near 0 (horizontal) and near pi/2 (vertical)
-    # The strip axis is the one with more total line length
-    horiz_mask = np.abs(angles) < np.pi / 4
-    vert_mask = ~horiz_mask
-
-    horiz_weight = lengths[horiz_mask].sum() if horiz_mask.any() else 0
-    vert_weight = lengths[vert_mask].sum() if vert_mask.any() else 0
-
-    if vert_weight > horiz_weight:
-        # Strip is roughly vertical — use vertical lines
-        mask = vert_mask
-        # Normalize angles to be near pi/2
-        selected = angles[mask]
-        selected = np.where(selected < 0, selected + np.pi, selected)
-        base_angle = np.pi / 2
-    else:
-        mask = horiz_mask
-        selected = angles[mask]
-        base_angle = 0.0
-
-    if len(selected) == 0:
-        return 0.0
-
-    # Length-weighted mean of deviations from base angle
-    weights = lengths[mask]
-    deviation = np.average(selected - base_angle, weights=weights)
-    return base_angle + deviation
-
 
 def _compute_strip_profiles(gray: np.ndarray, is_vertical: bool
                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -412,19 +356,16 @@ def detect_frames(
     sh, sw = gray_small.shape[:2]
     print(f"  Preprocessing ({_time.monotonic()-_t:.2f}s, work res {sw}x{sh})")
 
-    _t = _time.monotonic()
-    # Step 1: Estimate strip orientation
-    strip_angle = _estimate_strip_orientation(gray_small)
-    print(f"  Strip angle: {math.degrees(strip_angle):.2f} deg ({_time.monotonic()-_t:.2f}s)")
-
-    # Step 2: Initial placement at work resolution
+    # Step 1: Initial placement at work resolution.
+    # Angle is initialized to 0 — per-frame angles are computed precisely
+    # in step 7 (Theil-Sen), making a global estimate unnecessary.
     work_info = {
         "frame_w": strip_info["frame_w"] * work_scale,
         "frame_h": strip_info["frame_h"] * work_scale,
         "pitch_px": strip_info["pitch_px"] * work_scale,
         "is_vertical": strip_info["is_vertical"],
     }
-    frames = _initial_placement(sh, sw, actual_n, work_info, strip_angle)
+    frames = _initial_placement(sh, sw, actual_n, work_info, 0.0)
 
     _t = _time.monotonic()
     # Step 3: Compute dual 1D projection profiles (avoiding sprocket holes)
@@ -454,7 +395,7 @@ def detect_frames(
     # Downsample the gradient profile for DTW speed (O(n*m*band) is expensive
     # at full resolution). DTW finds coarse edge positions which are then
     # refined by snapping to peaks in the full-resolution gradient.
-    dtw_max_len = 2000
+    dtw_max_len = 1000
     dtw_scale = min(dtw_max_len / len(grad_avg), 1.0)
     if dtw_scale < 1.0:
         grad_avg_dtw = cv2.resize(grad_avg.reshape(1, -1),
