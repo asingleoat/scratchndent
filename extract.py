@@ -511,7 +511,7 @@ def switch_to_image(idx: int) -> None:
 
     # Read DPI from file metadata for parameter scaling
     CURRENT_DPI = read_tiff_dpi(INPUT_PATH)
-    print(f"Loading {INPUT_PATH} ({idx + 1}/{len(IMAGE_LIST)})...")
+    print(f"Loading {Path(INPUT_PATH).name} ({idx + 1}/{len(IMAGE_LIST)})...")
     rgb, ir = load_image(INPUT_PATH)
     h, w = rgb.shape[:2]
     FULL_WIDTH, FULL_HEIGHT = w, h
@@ -828,7 +828,7 @@ class Handler(BaseHTTPRequestHandler):
                 if FULL_IMG is not None:
                     rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
                 else:
-                    print(f"  Reading rebate region from {INPUT_PATH}...")
+                    print(f"  Reading rebate region from {Path(INPUT_PATH).name}...")
                     with tifffile.TiffFile(INPUT_PATH) as tif:
                         page = tif.pages[0]
                         full = page.asarray()

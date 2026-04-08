@@ -419,20 +419,23 @@ def detect_frames(
         strip_len = sw
         frame_strip_dim = work_info["frame_w"]
 
-    # DTW dimensions are in the downsampled space
-    frame_strip_dim_dtw = frame_strip_dim * dtw_scale
-    gap_dim = work_info["pitch_px"] - frame_strip_dim
-    if gap_dim < 1:
-        gap_dim = frame_strip_dim * 0.05
-    gap_dim_dtw = gap_dim * dtw_scale
-
-
-    # Build template: 1D array where 1.0 = expected edge, 0.0 = silence.
-    # Use 90% of nominal frame dimension — the actual exposed frame is
-    # slightly smaller than the physical gate size, and users typically
-    # crop slightly inside the frame border.
-    effective_frame_dim = int(frame_strip_dim_dtw * 0.90)
-    effective_gap = int(frame_strip_dim_dtw * 0.10 + gap_dim_dtw)
+    # Build DTW template using physical mm ratios, not pixel estimates.
+    # The template only needs correct proportions — DTW warps to match
+    # the actual signal. Using mm ratios avoids error from the scan being
+    # wider than the actual film strip (which inflates px_per_mm by ~5%).
+    frame_mm_along = max(fmt["frame_mm"])  # frame dim along strip axis
+    gap_mm = fmt["pitch_mm"] - frame_mm_along
+    total_mm = actual_n * fmt["pitch_mm"]
+    # Template length in DTW samples, proportional to physical length
+    dtw_obs_len = len(grad_avg_dtw) if dtw_scale < 1.0 else len(grad_avg)
+    mm_to_dtw = dtw_obs_len / (strip_len * 1.0)  # approximate, DTW handles mismatch
+    effective_frame_dim = max(1, int(frame_mm_along * mm_to_dtw * strip_len / (strip_len)))
+    # Simpler: just use the ratio of frame to pitch to set template proportions
+    # at a fixed template resolution
+    template_len_target = min(dtw_obs_len, 1000)
+    samples_per_mm = template_len_target / total_mm
+    effective_frame_dim = max(1, int(frame_mm_along * samples_per_mm))
+    effective_gap = max(1, int(gap_mm * samples_per_mm))
     template_parts = []
     for i in range(actual_n):
         template_parts.append(1.0)                                    # frame start edge
@@ -462,8 +465,7 @@ def detect_frames(
     scale_ratio = n_o / n_t
     # Band must be wide enough to accommodate strip margins (frames don't
     # start at the image edge) and variable film advance
-    strip_len_dtw = int(strip_len * dtw_scale)
-    band = int(max(strip_len_dtw * 0.1, frame_strip_dim_dtw * 0.5))
+    band = int(max(n_o * 0.1, effective_frame_dim * 0.5))
 
     # Subsequence DTW: template can start anywhere in the observation.
     # cost[0, j] = 0 for all j (free start position).
