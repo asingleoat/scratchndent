@@ -863,7 +863,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._respond(400, "application/json",
                                   json.dumps({"error": "No image loaded"}).encode())
             except Exception as e:
-                import traceback; traceback.print_exc()
                 print(f"  Auto-detect error: {e}")
                 self._respond(500, "application/json",
                               json.dumps({"error": str(e)}).encode())

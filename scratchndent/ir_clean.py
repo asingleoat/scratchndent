@@ -145,8 +145,6 @@ def make_defect_mask(
 
     ir_max = float(ir.max()) if ir.max() > 0 else 1.0
     ir_f = ir.astype(np.float32) / ir_max
-    h_ir, w_ir = ir_f.shape[:2]
-    print(f"    make_defect_mask: {w_ir}x{h_ir}, {ir_f.size/1e6:.1f}M pixels")
 
     # --- Adaptive ratio-based detection ---
 
@@ -184,8 +182,8 @@ def make_defect_mask(
     t_pass2 = _time.monotonic() - t
 
     n_dust = np.count_nonzero(dust_mask)
-    print(f"    Dust: {n_dust} px ({100*n_dust/dust_mask.size:.2f}%) "
-          f"[blur1={t_blur1:.2f}s pass1={t_pass1:.2f}s pass2={t_pass2:.2f}s]")
+    print(f"    Dust detection: {n_dust} px ({100*n_dust/dust_mask.size:.2f}%) "
+          f"in {t_blur1+t_pass1+t_pass2:.2f}s")
 
     # --- Line-based detection (hairs, fine scratches) ---
 
@@ -214,8 +212,8 @@ def make_defect_mask(
     t_gate = _time.monotonic() - t
 
     n_lines = np.count_nonzero(line_mask)
-    print(f"    Lines: {n_lines} px ({100*n_lines/line_mask.size:.2f}%) "
-          f"[prep={t_prep:.2f}s meijering={t_meijering:.2f}s gate={t_gate:.2f}s]")
+    print(f"    Line detection: {n_lines} px ({100*n_lines/line_mask.size:.2f}%) "
+          f"in {t_prep+t_meijering+t_gate:.2f}s")
 
     # --- Combine + morphology ---
     t = _time.monotonic()
@@ -245,7 +243,7 @@ def make_defect_mask(
     t_morph = _time.monotonic() - t
 
     coverage = np.count_nonzero(mask) / mask.size
-    print(f"    Morphology: {t_morph:.2f}s | final coverage: {100*coverage:.2f}%")
+    print(f"    Mask finalized: {100*coverage:.2f}% coverage ({t_morph:.2f}s)")
 
     if coverage > max_coverage:
         print(f"WARNING: defect mask covers {100*coverage:.1f}% of image — "

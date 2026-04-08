@@ -9,6 +9,7 @@ similar in size, evenly spaced, and similarly oriented.
 """
 
 import math
+import time as _time
 
 import cv2
 import numpy as np
@@ -370,7 +371,6 @@ def detect_frames(
           f"{actual_n} frames, "
           f"frame {float(strip_info['frame_w']):.0f}x{float(strip_info['frame_h']):.0f}px")
 
-    import time as _time
     t_total = _time.monotonic()
     _t = _time.monotonic()
 
@@ -656,9 +656,9 @@ def detect_frames(
     # for each frame edge, find the peak position in each strip.
     # Fit a line (peak position vs strip x-position) to get the angle.
     # This is robust to individual strips hitting image content.
-    n_angle_strips = 10
+    n_angle_strips = 20
     cross_dim_px = sw if is_vert else sh
-    strip_positions = np.linspace(0.25, 0.75, n_angle_strips)
+    strip_positions = np.linspace(0.20, 0.80, n_angle_strips)
     angle_band_width = max(1, cross_dim_px // 20)
 
     img_f = gray_small.astype(np.float64)
@@ -698,8 +698,18 @@ def detect_frames(
                 continue
             for s_idx in range(n_angle_strips):
                 g = angle_grads[s_idx]
-                peak = lo + int(np.argmax(g[lo:hi]))
-                edge_peak_positions.append((angle_x[s_idx], float(peak)))
+                idx = lo + int(np.argmax(g[lo:hi]))
+                # Sub-pixel refinement via quadratic interpolation
+                if lo < idx < hi - 1:
+                    a, b, c = g[idx - 1], g[idx], g[idx + 1]
+                    denom = a - 2 * b + c
+                    if abs(denom) > 1e-10:
+                        peak = idx + 0.5 * (a - c) / denom
+                    else:
+                        peak = float(idx)
+                else:
+                    peak = float(idx)
+                edge_peak_positions.append((angle_x[s_idx], peak))
 
         if len(edge_peak_positions) >= 4:
             xs = np.array([p[0] for p in edge_peak_positions])
