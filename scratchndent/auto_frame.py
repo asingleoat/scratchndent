@@ -103,8 +103,135 @@ def _compute_strip_profiles(gray: np.ndarray, is_vertical: bool
     return profiles[0], profiles[1], profiles[2], cross_profile
 
 
-def _analyze_strip(img_h: int, img_w: int, fmt: dict) -> dict:
+def _detect_film_extent(image: np.ndarray
+                        ) -> tuple[float, float, float] | None:
+    """Detect the actual film strip extent and rotation via rotated bbox.
+
+    The image dimensions overestimate the film strip when the strip is
+    angled on the scanner bed: a strip rotated by theta produces an
+    axis-aligned bounding box wider than the strip itself by L*sin(theta).
+    For example, a 35mm strip 190mm long rotated by 1.7 deg has an
+    axis-aligned bbox 40.6mm wide -- a 16% overestimate that breaks the
+    pitch-ratio frame count formula.
+
+    Methodology (borrowed from epdaughter's detect_film_area):
+      1. Otsu threshold separates dark film from bright scanner background
+      2. Morphological closing merges frame interiors and inter-frame gaps
+         into a single connected blob
+      3. Largest connected component = the film strip
+      4. cv2.minAreaRect gives a rotated bounding rectangle whose narrow
+         side is the actual film width and whose long-edge direction is
+         the coarse strip rotation
+
+    The returned angle is a *coarse* estimate of the overall strip
+    rotation. Per-frame Theil-Sen still runs in step 7 to refine each
+    frame's exact angle (frames may be slightly misaligned from the
+    strip).
+
+    Sign convention: positive angle = strip leans upper-left to
+    lower-right in image coordinates -- matches the per-frame angle
+    convention used by step 7 / step 8.
+
+    Returns (strip_narrow_px, strip_long_px, strip_angle_rad) of the
+    rotated bounding rect, or None if no clear film/background
+    separation is found (tightly cropped scan), in which case callers
+    fall back to image dimensions and zero rotation.
+    """
+    # 8-bit grayscale (no inversion -- film is darker than scanner bg)
+    if image.ndim == 3:
+        if image.dtype == np.uint16:
+            gray = (image.mean(axis=2) / 256).astype(np.uint8)
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    elif image.dtype == np.uint16:
+        gray = (image / 256).astype(np.uint8)
+    else:
+        gray = image
+
+    # Otsu split: scanner background (bright) vs film (darker)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    film_mask = (binary == 0).astype(np.uint8) * 255
+
+    # Close gaps within the film region (frame interiors are dark, gaps
+    # are slightly less dark) so the strip becomes one connected blob.
+    # Kernel must exceed the inter-frame gap (~2mm) but stay smaller than
+    # the spacing between separate strips. ~5% of the smaller image
+    # dimension works for typical scans.
+    h, w = gray.shape
+    k = max(3, min(h, w) // 20)
+    k |= 1
+    kernel = np.ones((k, k), np.uint8)
+    film_mask = cv2.morphologyEx(film_mask, cv2.MORPH_CLOSE, kernel)
+
+    # Largest connected film blob
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        film_mask, connectivity=8)
+    if n_labels < 2:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_idx = 1 + int(np.argmax(areas))
+    if areas[largest_idx - 1] < film_mask.size * 0.10:
+        return None
+
+    # Rotated bounding rect of the largest blob
+    component = (labels == largest_idx).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest_contour = max(contours, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest_contour)
+    (_, _), (rw, rh), _ = rect
+    if rw < 1 or rh < 1:
+        return None
+
+    # Compute strip rotation from the long edge of the rotated rect.
+    # cv2.minAreaRect's own angle field has a confusing convention that
+    # depends on which side is considered "width"; using the box edges
+    # directly is unambiguous.
+    box = cv2.boxPoints(rect)
+    edge_lengths = [
+        float(np.linalg.norm(box[(i + 1) % 4] - box[i])) for i in range(4)
+    ]
+    longest_idx = int(np.argmax(edge_lengths))
+    pa = box[longest_idx]
+    pb = box[(longest_idx + 1) % 4]
+    dx = float(pb[0] - pa[0])
+    dy = float(pb[1] - pa[1])
+
+    is_vertical_image = h > w
+    if is_vertical_image:
+        # Long axis should point downward; flip if needed
+        if dy < 0:
+            dx, dy = -dx, -dy
+        # Theil-Sen convention (step 7): positive angle = frame edge
+        # tilts down-right = frame rotated CW visually = strip leans
+        # upper-right -> lower-left, i.e. long-axis vector has dx < 0.
+        # atan2(dx, dy) gives the deviation from straight-down with the
+        # opposite sign convention (positive for dx > 0 = UL->LR), so
+        # negate to match Theil-Sen.
+        strip_angle = -math.atan2(dx, dy)
+    else:
+        # Long axis should point rightward; flip if needed
+        if dx < 0:
+            dx, dy = -dx, -dy
+        # Same sign reasoning for horizontal strip: a CW-rotated
+        # horizontal strip has long-axis vector with dy < 0, so
+        # atan2(dy, dx) is negative for the case Theil-Sen calls
+        # positive. Negate to match.
+        strip_angle = -math.atan2(dy, dx)
+
+    return float(min(rw, rh)), float(max(rw, rh)), float(strip_angle)
+
+
+def _analyze_strip(img_h: int, img_w: int, fmt: dict,
+                   film_extent: tuple[float, float] | None = None) -> dict:
     """Compute frame count, dimensions, and orientation from image + format.
+
+    If `film_extent` is provided (from _detect_film_extent), the actual
+    film strip dimensions are used instead of the image dimensions. This
+    matters when the strip is angled on the scanner bed: the image bbox
+    overestimates the strip width, which breaks the frame count formula.
 
     Returns a dict with:
       n_frames: int
@@ -118,7 +245,11 @@ def _analyze_strip(img_h: int, img_w: int, fmt: dict) -> dict:
 
     # Determine strip orientation: long dimension is the strip axis
     is_vertical = img_h > img_w
-    if is_vertical:
+
+    if film_extent is not None:
+        # Use measured film extent (rotation-corrected)
+        strip_narrow_px, strip_long_px = film_extent[0], film_extent[1]
+    elif is_vertical:
         strip_narrow_px = img_w
         strip_long_px = img_h
     else:
@@ -302,18 +433,72 @@ def detect_frames(
                          f"Available: {list(FORMATS.keys())}")
 
     fmt = FORMATS[format_name]
-    img_h, img_w = image.shape[:2]
+    orig_h, orig_w = image.shape[:2]
 
-    # Analyze strip geometry from physical dimensions
-    strip_info = _analyze_strip(img_h, img_w, fmt)
+    # Detect actual film extent + coarse strip rotation. Corrects for the
+    # strip being angled on the scanner bed: an angled strip inflates the
+    # axis-aligned bounding box width by L*sin(theta), which breaks the
+    # frame-count formula and degrades 1D projection profiles. Falls
+    # back to image dimensions and zero rotation if film/background
+    # separation can't be found.
+    film_extent = _detect_film_extent(image)
+
+    # If we got a meaningful strip rotation, rotate the input image so
+    # the strip is axis-aligned. This is a coarse alignment -- per-frame
+    # Theil-Sen still runs in step 7 to refine each frame's exact angle
+    # (frames may be slightly misaligned from the strip). All internal
+    # detection runs on the rotated image; output coords are transformed
+    # back to native scan coords at the end.
+    rotation_threshold_rad = math.radians(0.1)
+    if film_extent is not None and abs(film_extent[2]) > rotation_threshold_rad:
+        strip_angle_rad = film_extent[2]
+        # Rotate the input image to undo the strip's lean so it becomes
+        # axis-aligned. strip_angle is in Theil-Sen convention: positive
+        # = frame/strip rotated CW visually. To undo a CW lean we rotate
+        # the image content CCW visually. cv2's positive angle parameter
+        # is visual CCW (verified empirically), so we pass +strip_angle.
+        center = (orig_w / 2.0, orig_h / 2.0)
+        rot_M = cv2.getRotationMatrix2D(
+            center, math.degrees(strip_angle_rad), 1.0)
+        cos_v = abs(rot_M[0, 0])
+        sin_v = abs(rot_M[0, 1])
+        new_w = int(orig_h * sin_v + orig_w * cos_v)
+        new_h = int(orig_h * cos_v + orig_w * sin_v)
+        rot_M[0, 2] += new_w / 2.0 - center[0]
+        rot_M[1, 2] += new_h / 2.0 - center[1]
+        # rot_M (returned by getRotationMatrix2D + canvas-expansion shift)
+        # is the FORWARD transform mapping src (original) coords to dst
+        # (rotated/expanded) coords. warpAffine internally inverts it to
+        # do the actual pixel sampling. We need the inverse for our
+        # output coordinate transform (rotated -> original).
+        image = cv2.warpAffine(
+            image, rot_M, (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        rotation_M_rot_to_orig = cv2.invertAffineTransform(rot_M)
+    else:
+        strip_angle_rad = 0.0
+        rotation_M_rot_to_orig = None
+
+    img_h, img_w = image.shape[:2]
+    strip_info = _analyze_strip(img_h, img_w, fmt, film_extent=film_extent)
     if n_frames is not None:
         strip_info["n_frames"] = n_frames
     actual_n = strip_info["n_frames"]
 
+    extent_note = ""
+    if film_extent is not None:
+        extent_note = (
+            f", film extent {film_extent[1]:.0f}x{film_extent[0]:.0f}px "
+            f"(image {max(orig_h,orig_w)}x{min(orig_h,orig_w)}px), "
+            f"strip rotation {math.degrees(film_extent[2]):+.2f} deg"
+        )
     print(f"  Auto-detect: {format_name}, "
           f"{'vertical' if strip_info['is_vertical'] else 'horizontal'} strip, "
           f"{actual_n} frames, "
-          f"frame {float(strip_info['frame_w']):.0f}x{float(strip_info['frame_h']):.0f}px")
+          f"frame {float(strip_info['frame_w']):.0f}x{float(strip_info['frame_h']):.0f}px"
+          f"{extent_note}")
 
     t_total = _time.monotonic()
     _t = _time.monotonic()
@@ -564,36 +749,82 @@ def detect_frames(
             snapped.append(max(int(min_pos), pos))
     edge_obs_positions = snapped
 
-    # Fix last frame's trailing edge using paired product.
-    # The first N-1 frames give us a reliable expected dimension. The last
-    # frame's trailing edge is vulnerable to hitting the image boundary
-    # (which produces a strong false gradient). Use the paired product
-    # of the gradient at (start, start+expected_dim) to find the correct
-    # trailing edge, same approach as cross-strip detection.
-    if actual_n >= 2 and len(edge_obs_positions) == 2 * actual_n:
-        # Median frame dimension from the first N-1 frames
+    # Fix the last frame's edges using inductive bias from earlier frames.
+    # The first N-1 frames give us reliable median pitch (start-to-start
+    # spacing) and median frame dimension. DTW can drift on the final
+    # frame -- the strip's actual length often differs slightly from the
+    # template's, and the residual error accumulates -- placing the last
+    # frame's start far from the true position. The default snap radius
+    # (15% of frame dim) is then too small to recover. Re-derive both
+    # edges of the last frame from the earlier-frame median statistics
+    # and snap each to the nearest gradient peak using a wider window.
+    if actual_n >= 3 and len(edge_obs_positions) == 2 * actual_n:
+        # Median pitch and dim from the first N-1 frames
+        starts = [edge_obs_positions[2 * i] for i in range(actual_n)]
         dims = [edge_obs_positions[2*i+1] - edge_obs_positions[2*i]
                 for i in range(actual_n - 1)]
+        pitches = [starts[i + 1] - starts[i] for i in range(actual_n - 2)]
+        median_pitch = int(np.median(pitches))
         expected_dim = int(np.median(dims))
 
-        last_start = edge_obs_positions[-2]
-        search_lo = max(0, last_start + expected_dim - snap_radius)
-        search_hi = min(len(grad_avg), last_start + expected_dim + snap_radius + 1)
+        # Predict last frame's start from earlier-frame pitch
+        expected_start = starts[-2] + median_pitch
+        # Wider snap window than the default -- DTW drift may put the
+        # initial position well outside the standard radius
+        wide_radius = max(snap_radius, expected_dim // 4)
 
-        if search_hi > search_lo:
-            # Score each candidate end position by gradient strength
-            # weighted by proximity to the expected dimension. This
-            # strongly biases toward edges that produce a frame length
-            # consistent with the other frames.
-            candidates = grad_avg[search_lo:search_hi].copy()
-            expected_pos = last_start + expected_dim
-            for j in range(len(candidates)):
-                dist = abs((search_lo + j) - expected_pos)
-                # Gaussian weighting: sigma = 2% of expected_dim
-                sigma = expected_dim * 0.02
-                candidates[j] *= math.exp(-0.5 * (dist / sigma) ** 2)
-            best_end = search_lo + int(np.argmax(candidates))
-            edge_obs_positions[-1] = best_end
+        def _snap_to_peak_near(target: int, radius: int, sigma: float) -> int:
+            lo = max(0, target - radius)
+            hi = min(len(grad_avg), target + radius + 1)
+            if hi <= lo:
+                return target
+            window = grad_avg[lo:hi].copy()
+            # Gaussian weighting around the target position
+            for j in range(len(window)):
+                dist = abs((lo + j) - target)
+                window[j] *= math.exp(-0.5 * (dist / sigma) ** 2)
+            return lo + int(np.argmax(window))
+
+        # Start snap: median pitch from earlier frames is highly
+        # consistent (typically std < 1% of pitch), so the predicted
+        # expected_start is already very close to the truth. Use a wide
+        # search radius (to recover from arbitrary DTW drift) but a
+        # tight sigma so the snap stays near expected_start and only
+        # refines to a nearby gradient peak.
+        new_start = _snap_to_peak_near(
+            expected_start, wide_radius,
+            sigma=max(expected_dim * 0.01, 1.0))
+        # Enforce monotonicity vs previous frame's end
+        new_start = max(new_start, edge_obs_positions[-3] + 3)
+
+        # End snap: the last frame's trailing edge is close to the
+        # strip's end, where the film-to-background transition produces
+        # a strong gradient just past the actual frame edge. A wide
+        # search would get pulled into that strip-end gradient. But the
+        # DTW-drift problem only affects the start; with a reliable
+        # new_start in hand, the predicted end (new_start + expected_dim)
+        # is accurate to within a few pixels because the earlier-frame
+        # dims are extremely consistent (typically std < 3 px). Search
+        # a very tight window around the predicted end to refine to the
+        # actual gradient peak -- the radius needs to cover the
+        # earlier-frame dim variance and a bit more, but stay well
+        # inside the inter-frame distance to the strip-end gradient.
+        end_target = new_start + expected_dim
+        # Use 1.5x the observed earlier-frame dim std, with a small
+        # floor. The radius is intentionally much smaller than the
+        # snap_radius used for general edges.
+        dim_std = float(np.std(dims)) if len(dims) > 1 else 3.0
+        end_radius = max(int(dim_std * 1.5) + 2, 4)
+        end_lo = max(new_start + expected_dim // 2,
+                     end_target - end_radius)
+        end_hi = min(len(grad_avg), end_target + end_radius + 1)
+        if end_hi > end_lo:
+            new_end = end_lo + int(np.argmax(grad_avg[end_lo:end_hi]))
+        else:
+            new_end = end_target
+
+        edge_obs_positions[-2] = new_start
+        edge_obs_positions[-1] = new_end
 
     # Place frames from edge pairs, enforcing aspect ratio
     target_aspect = work_info["frame_w"] / max(work_info["frame_h"], 1)
@@ -880,6 +1111,22 @@ def detect_frames(
 
     # Scale from work resolution back to full preview coords
     frames[:, :4] /= work_scale
+
+    # If we rotated the input image so the strip would be axis-aligned,
+    # transform frame centers from rotated coords back to original-image
+    # coords and add the global strip rotation to each frame's per-frame
+    # angle. The per-frame angles found by Theil-Sen (step 7) are
+    # residuals relative to the rotated strip; the original-coords angle
+    # is the sum of the residual and the global rotation.
+    if rotation_M_rot_to_orig is not None:
+        M = rotation_M_rot_to_orig  # 2x3, rotated coords -> original coords
+        for i in range(actual_n):
+            rcx, rcy = float(frames[i, 0]), float(frames[i, 1])
+            ocx = M[0, 0] * rcx + M[0, 1] * rcy + M[0, 2]
+            ocy = M[1, 0] * rcx + M[1, 1] * rcy + M[1, 2]
+            frames[i, 0] = ocx
+            frames[i, 1] = ocy
+            frames[i, 4] = float(frames[i, 4]) + strip_angle_rad
 
     # Aspect ratio string matches the selection orientation (w:h in image coords)
     narrow_mm = min(fmt["frame_mm"])

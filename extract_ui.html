@@ -123,6 +123,7 @@ canvas { position: absolute; top: 0; left: 0; cursor: crosshair; }
     <input id="auto-scale" type="number" value="0" min="-1" max="1" step="0.1"
            style="width:62px;font-size:12px" title="Scale adjustment for auto-detected frames (%). Positive grows frames, negative shrinks them.">%
     <button id="btn-clear" class="danger">Clear all</button>
+    <button id="btn-dump" title="Dump current selections to server console as ground truth">Dump</button>
     <span style="width:1px;height:24px;background:#555;margin:0 4px"></span>
     <label title="Export IR cleaned negative (dust/scratch removal only)"><input type="checkbox" id="chk-ir-neg"> IR cleaned</label>
     <label title="Export inverted positive (with IR cleaning and color inversion)"><input type="checkbox" id="chk-ir-inv" checked> IR + inverted</label>
@@ -1136,6 +1137,15 @@ document.getElementById('auto-scale').addEventListener('input', () => {
 
 document.getElementById('btn-clear').addEventListener('click', () => {
     selections = []; activeIdx = -1; updateSelList(); render();
+});
+
+document.getElementById('btn-dump').addEventListener('click', () => {
+    fetch('/debug/selections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selections, preview_scale: previewScale }),
+    });
+    statusEl.textContent = `Dumped ${selections.length} selections to server console`;
 });
 
 document.getElementById('btn-export').addEventListener('click', async () => {
