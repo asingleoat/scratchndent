@@ -368,7 +368,7 @@ LOADING: bool = False                     # True while switching images
 HAS_IR: bool = False                      # whether current image has IR channel
 IS_GRAYSCALE: bool = False                # whether current image is monochrome (e.g. IR-only scan)
 PROGRESS: str = ""                        # current export/processing status for GUI
-REBATE_RECT: dict | None = None           # {x, y, w, h} in full-res coords
+REBATE_RECT: dict | None = None           # {x, y, w, h, angle} full-res coords
 
 
 def set_progress(msg: str) -> None:
@@ -379,26 +379,93 @@ def set_progress(msg: str) -> None:
 
 
 def _rebate_in_bounds(shape: tuple, rect: dict) -> bool:
-    """Check if rebate rect fits within an image."""
+    """Check if a rotated rebate rect's center sits within an image."""
     h, w = shape[:2]
     r = rect
-    return (r["x"] >= 0 and r["y"] >= 0 and
-            r["x"] + r["w"] <= w and r["y"] + r["h"] <= h)
+    cx = r["x"] + r["w"] / 2
+    cy = r["y"] + r["h"] / 2
+    return 0 <= cx < w and 0 <= cy < h
 
 
-def make_rebate_mask(h: int, w: int) -> np.ndarray | None:
-    """Build a boolean mask from the rebate rectangle, if set."""
-    if REBATE_RECT is None:
+def _extract_rebate_pixels(img: np.ndarray, rect: dict) -> np.ndarray:
+    """Extract the rotated rebate region as an HxWx3 array."""
+    cx = rect["x"] + rect["w"] / 2
+    cy = rect["y"] + rect["h"] / 2
+    angle_deg = math.degrees(rect.get("angle", 0.0))
+    return crop_rotated_rect(img, cx, cy, rect["w"], rect["h"], angle_deg)
+
+
+def _compute_inter_frame_rebate(frames: list[dict]) -> dict | None:
+    """Pick an inter-frame gap and return a suggested rebate rect.
+
+    The inter-frame gap on a 35mm strip is unexposed orange film base --
+    exactly what we want for a Dmin sample. Picking the middle gap
+    (least likely to have edge artifacts) and shrinking slightly in
+    both axes keeps the rebate clear of frame content edges and the
+    sprocket hole region just outside the cross-strip frame dimension.
+
+    Returns {cx, cy, w, h, angle} in the same coordinate space as the
+    input frames, or None if there are fewer than 2 frames.
+    """
+    if len(frames) < 2:
         return None
-    r = REBATE_RECT
-    mask = np.zeros((h, w), dtype=bool)
-    y0 = max(0, r["y"])
-    y1 = min(h, r["y"] + r["h"])
-    x0 = max(0, r["x"])
-    x1 = min(w, r["x"] + r["w"])
-    if y1 > y0 and x1 > x0:
-        mask[y0:y1, x0:x1] = True
-    return mask
+
+    # Pick the middle gap (index = first frame of the central pair)
+    gap_idx = (len(frames) - 1) // 2
+    f0 = frames[gap_idx]
+    f1 = frames[gap_idx + 1]
+
+    # Strip orientation: the line connecting the two frame centers
+    # runs along the strip axis. The dominant axis tells us whether
+    # the strip is vertical (frames stacked along y) or horizontal.
+    dcx = f1["cx"] - f0["cx"]
+    dcy = f1["cy"] - f0["cy"]
+    is_vertical = abs(dcy) > abs(dcx)
+
+    # Gap center: midpoint of the two frame centers along the strip axis
+    gap_cx = (f0["cx"] + f1["cx"]) / 2
+    gap_cy = (f0["cy"] + f1["cy"]) / 2
+
+    pitch = math.hypot(dcx, dcy)
+    if is_vertical:
+        f_strip_dim = (f0["h"] + f1["h"]) / 2
+        f_cross_dim = (f0["w"] + f1["w"]) / 2
+    else:
+        f_strip_dim = (f0["w"] + f1["w"]) / 2
+        f_cross_dim = (f0["h"] + f1["h"]) / 2
+
+    gap_strip_size = pitch - f_strip_dim
+    if gap_strip_size <= 0:
+        return None
+
+    # Shrink to stay clear of frame content at the gap's strip-axis
+    # boundaries and avoid the sprocket-hole region just outside the
+    # frame's cross dimension. The shrink fractions are intentionally
+    # generous on the strip axis (the gap is small to begin with --
+    # ~2mm for 35mm) and modest on the cross axis (the cross dimension
+    # is the full frame width).
+    strip_margin = max(gap_strip_size * 0.2, 2.0)
+    cross_margin = f_cross_dim * 0.1
+    rebate_strip_dim = max(gap_strip_size - 2 * strip_margin, 1.0)
+    rebate_cross_dim = max(f_cross_dim - 2 * cross_margin, 1.0)
+
+    # Use the average angle of the two flanking frames
+    angle = (f0["angle"] + f1["angle"]) / 2
+
+    if is_vertical:
+        rebate_w = rebate_cross_dim
+        rebate_h = rebate_strip_dim
+    else:
+        rebate_w = rebate_strip_dim
+        rebate_h = rebate_cross_dim
+
+    return {
+        "cx": float(gap_cx),
+        "cy": float(gap_cy),
+        "w": float(rebate_w),
+        "h": float(rebate_h),
+        "angle": float(angle),
+    }
 
 
 def apply_inversion(img: np.ndarray) -> np.ndarray:
@@ -454,9 +521,8 @@ def ensure_loaded() -> None:
     # Dmin persists across the roll — set once from a good rebate area.
     if get_active_stock() and DMIN is None:
         if REBATE_RECT and _rebate_in_bounds(rgb.shape, REBATE_RECT):
-            r = REBATE_RECT
             set_progress("Computing Dmin from rebate selection...")
-            rebate_rgb = rgb[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+            rebate_rgb = _extract_rebate_pixels(rgb, REBATE_RECT)
             DMIN = compute_dmin(rebate_rgb)
         else:
             set_progress("Computing Dmin from full image (no rebate set)...")
@@ -828,26 +894,26 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
             REBATE_RECT = {
-                "x": int(body["x"]),
-                "y": int(body["y"]),
-                "w": int(body["w"]),
-                "h": int(body["h"]),
+                "x": float(body["x"]),
+                "y": float(body["y"]),
+                "w": float(body["w"]),
+                "h": float(body["h"]),
+                "angle": float(body.get("angle", 0.0)),
             }
-            print(f"  Rebate set: {REBATE_RECT}")
+            print(f"  Rebate set: x={REBATE_RECT['x']:.0f} y={REBATE_RECT['y']:.0f} "
+                  f"w={REBATE_RECT['w']:.0f} h={REBATE_RECT['h']:.0f} "
+                  f"angle={math.degrees(REBATE_RECT['angle']):+.2f} deg")
             # Compute Dmin from the rebate region. Use cached full image
-            # if available, otherwise read just the region from disk.
+            # if available, otherwise read just the page from disk.
             global DMIN
             if get_active_stock():
-                r = REBATE_RECT
                 if FULL_IMG is not None:
-                    rebate_rgb = FULL_IMG[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]]
+                    src_img = FULL_IMG
                 else:
                     print(f"  Reading rebate region from {Path(INPUT_PATH).name}...")
                     with tifffile.TiffFile(INPUT_PATH) as tif:
-                        page = tif.pages[0]
-                        full = page.asarray()
-                        rebate_rgb = full[r["y"]:r["y"]+r["h"], r["x"]:r["x"]+r["w"]].copy()
-                        del full
+                        src_img = tif.pages[0].asarray()
+                rebate_rgb = _extract_rebate_pixels(src_img, REBATE_RECT)
                 DMIN = compute_dmin(rebate_rgb)
                 invalidate_inversion_cache()
                 print(f"  Dmin updated: R={DMIN[0]:.4f} G={DMIN[1]:.4f} B={DMIN[2]:.4f}")
@@ -880,10 +946,18 @@ class Handler(BaseHTTPRequestHandler):
                         fh = f["h"] / PREVIEW_SCALE
                         print(f"    Frame {i+1}: {fw:.0f}x{fh:.0f}px, "
                               f"rotation {math.degrees(f['angle']):+.2f} deg")
+                    rebate = _compute_inter_frame_rebate(result["frames"])
+                    if rebate is not None:
+                        rw_full = rebate["w"] / PREVIEW_SCALE
+                        rh_full = rebate["h"] / PREVIEW_SCALE
+                        print(f"    Suggested rebate: {rw_full:.0f}x{rh_full:.0f}px "
+                              f"@ ({rebate['cx']/PREVIEW_SCALE:.0f}, "
+                              f"{rebate['cy']/PREVIEW_SCALE:.0f})")
                     self._respond(200, "application/json",
                                   json.dumps({"ok": True,
                                               "frames": result["frames"],
                                               "aspect": result["aspect"],
+                                              "rebate": rebate,
                                               }).encode())
                 else:
                     self._respond(400, "application/json",

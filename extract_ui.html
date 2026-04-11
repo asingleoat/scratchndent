@@ -283,7 +283,8 @@ let activeIdx = -1;
 let mode = 'idle'; // idle, drawing, moving, resizing, rotating, drawing_rebate
 let drawStart = null;
 let dragInfo = null;
-let rebateRect = null; // {x, y, w, h} in preview coords, or null
+let rebateRect = null;     // {x, y, w, h, angle} in preview coords, or null
+let rebateActive = false;  // true when rebate has editing handles shown
 
 const HANDLE_SIZE = 8;
 const ROT_HANDLE_DIST = 30;
@@ -550,6 +551,7 @@ async function switchImage(idx) {
     activeIdx = -1;
     lastAutoFrames = null;
     rebateRect = null;
+    rebateActive = false;
     updateSelList();
     const resp = await fetch('/switch', {
         method: 'POST',
@@ -690,33 +692,52 @@ function getHandles(s) {
     };
 }
 
-function hitTest(mx, my) {
-    const threshold = HANDLE_SIZE / scale;
-    for (let i = selections.length - 1; i >= 0; i--) {
-        const s = selections[i];
+// Hit test against a single rect-with-angle. If checkHandles is true,
+// the rotation/resize handles are also tested; otherwise only inside.
+function hitTestRect(mx, my, s, threshold, checkHandles) {
+    if (checkHandles) {
         const h = getHandles(s);
         // Rotation handles (all 4 sides)
         for (const rk of ['rot_t', 'rot_b', 'rot_l', 'rot_r']) {
             const [rx, ry] = h[rk];
             if (Math.hypot(mx - rx, my - ry) < threshold * 1.5) {
-                return { type: 'rotate', idx: i };
+                return { type: 'rotate' };
             }
         }
         // Corner/edge handles
         for (const name of ['tl', 'tr', 'bl', 'br', 'tm', 'bm', 'ml', 'mr']) {
             const [px, py] = h[name];
             if (Math.hypot(mx - px, my - py) < threshold) {
-                return { type: 'resize', idx: i, handle: name };
+                return { type: 'resize', handle: name };
             }
         }
-        // Inside test (unrotated space)
-        const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
-        const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
-        const dx = mx - cx, dy = my - cy;
-        const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
-        if (Math.abs(lx) < s.w / 2 && Math.abs(ly) < s.h / 2) {
-            return { type: 'move', idx: i };
-        }
+    }
+    // Inside test (unrotated space)
+    const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
+    const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+    const dx = mx - cx, dy = my - cy;
+    const lx = dx * cos - dy * sin, ly = dx * sin + dy * cos;
+    if (Math.abs(lx) < s.w / 2 && Math.abs(ly) < s.h / 2) {
+        return { type: 'move' };
+    }
+    return null;
+}
+
+function hitTest(mx, my) {
+    const threshold = HANDLE_SIZE / scale;
+    // Frame selections take priority. Handles for non-active selections
+    // are checked too (matches existing behavior); inside test wins on
+    // newer selections via reverse iteration.
+    for (let i = selections.length - 1; i >= 0; i--) {
+        const r = hitTestRect(mx, my, selections[i], threshold, true);
+        if (r) return { ...r, target: 'frame', idx: i };
+    }
+    // Rebate (single rect). Handles are only hit-testable when the
+    // rebate is the active editable item; otherwise just the inside,
+    // so clicking on it activates editing.
+    if (rebateRect) {
+        const r = hitTestRect(mx, my, rebateRect, threshold, rebateActive);
+        if (r) return { ...r, target: 'rebate' };
     }
     return null;
 }
@@ -734,21 +755,59 @@ function render() {
     ctx.drawImage(img, 0, 0);
     ctx.restore();
 
-    // Draw rebate region
+    // Draw rebate region (rotated rect; matches frame-selection geometry
+    // so it can be moved/resized/rotated with the same handles).
     if (rebateRect) {
         const r = rebateRect;
-        const [rx, ry] = imgToScreen(r.x, r.y);
+        const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+        const [scx, scy] = imgToScreen(cx, cy);
+        ctx.save();
+        ctx.translate(scx, scy);
+        ctx.rotate(r.angle);
         const rw = r.w * scale, rh = r.h * scale;
         ctx.fillStyle = 'rgba(255, 160, 0, 0.15)';
-        ctx.fillRect(rx, ry, rw, rh);
+        ctx.fillRect(-rw / 2, -rh / 2, rw, rh);
         ctx.strokeStyle = '#fa0';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = rebateActive ? 2 : 1.5;
         ctx.setLineDash([6, 4]);
-        ctx.strokeRect(rx, ry, rw, rh);
+        ctx.strokeRect(-rw / 2, -rh / 2, rw, rh);
         ctx.setLineDash([]);
         ctx.fillStyle = '#fa0';
         ctx.font = '11px system-ui';
-        ctx.fillText('rebate (Dmin)', rx + 4, ry + 14);
+        ctx.textAlign = 'left';
+        ctx.fillText('rebate (Dmin)', -rw / 2 + 4, -rh / 2 + 14);
+
+        if (rebateActive) {
+            // Resize handles
+            ctx.fillStyle = '#fa0';
+            const hs = HANDLE_SIZE;
+            for (const [hx, hy] of [
+                [-rw/2, -rh/2], [rw/2, -rh/2], [-rw/2, rh/2], [rw/2, rh/2],
+                [0, -rh/2], [0, rh/2], [-rw/2, 0], [rw/2, 0],
+            ]) {
+                ctx.fillRect(hx - hs/2, hy - hs/2, hs, hs);
+            }
+            // Rotation handles (all 4 sides)
+            const rotPositions = [
+                [0, -rh/2, 0, -rh/2 - ROT_HANDLE_DIST],
+                [0, rh/2, 0, rh/2 + ROT_HANDLE_DIST],
+                [-rw/2, 0, -rw/2 - ROT_HANDLE_DIST, 0],
+                [rw/2, 0, rw/2 + ROT_HANDLE_DIST, 0],
+            ];
+            for (const [x1, y1, x2, y2] of rotPositions) {
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+                ctx.strokeStyle = '#fa0';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(x2, y2, hs * 0.7, 0, Math.PI * 2);
+                ctx.fillStyle = '#fa0';
+                ctx.fill();
+            }
+        }
+        ctx.restore();
     }
 
     // Draw selections
@@ -819,28 +878,43 @@ canvas.addEventListener('mousedown', (e) => {
     const hit = hitTest(mx, my);
 
     if (hit) {
-        activeIdx = hit.idx;
-        const s = selections[hit.idx];
+        // Resolve which rect we're operating on and toggle active state
+        let s;
+        if (hit.target === 'frame') {
+            activeIdx = hit.idx;
+            rebateActive = false;
+            s = selections[hit.idx];
+        } else { // 'rebate'
+            rebateActive = true;
+            activeIdx = -1;
+            s = rebateRect;
+        }
         if (hit.type === 'move') {
             mode = 'moving';
-            dragInfo = { startMx: mx, startMy: my, origX: s.x, origY: s.y };
+            dragInfo = { target: hit.target, startMx: mx, startMy: my,
+                         origX: s.x, origY: s.y };
         } else if (hit.type === 'resize') {
             mode = 'resizing';
-            dragInfo = { handle: hit.handle, startMx: mx, startMy: my,
+            dragInfo = { target: hit.target, handle: hit.handle,
+                         startMx: mx, startMy: my,
                          origX: s.x, origY: s.y, origW: s.w, origH: s.h };
         } else if (hit.type === 'rotate') {
             mode = 'rotating';
             const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
-            dragInfo = { cx, cy, startAngle: Math.atan2(my - cy, mx - cx), origAngle: s.angle };
+            dragInfo = { target: hit.target, cx, cy,
+                         startAngle: Math.atan2(my - cy, mx - cx),
+                         origAngle: s.angle };
         }
         updateSelList(); render();
     } else if (mode === 'rebate_pending') {
         mode = 'drawing_rebate';
         drawStart = { x: mx, y: my };
     } else {
-        // Start drawing new selection
+        // Start drawing new selection; deselect rebate
+        rebateActive = false;
         mode = 'drawing';
         drawStart = { x: mx, y: my };
+        render();
     }
 });
 
@@ -854,7 +928,9 @@ canvas.addEventListener('mousemove', (e) => {
             y: Math.min(drawStart.y, my),
             w: Math.abs(w),
             h: Math.abs(h),
+            angle: 0,
         };
+        rebateActive = true;
         render();
     } else if (mode === 'drawing' && drawStart) {
         let w = mx - drawStart.x, h = my - drawStart.y;
@@ -877,12 +953,12 @@ canvas.addEventListener('mousemove', (e) => {
         }
         render();
     } else if (mode === 'moving' && dragInfo) {
-        const s = selections[activeIdx];
+        const s = dragInfo.target === 'rebate' ? rebateRect : selections[activeIdx];
         s.x = dragInfo.origX + (mx - dragInfo.startMx);
         s.y = dragInfo.origY + (my - dragInfo.startMy);
         render(); updateSelList();
     } else if (mode === 'resizing' && dragInfo) {
-        const s = selections[activeIdx];
+        const s = dragInfo.target === 'rebate' ? rebateRect : selections[activeIdx];
         const cos = Math.cos(-s.angle), sin = Math.sin(-s.angle);
         const cx = dragInfo.origX + dragInfo.origW / 2;
         const cy = dragInfo.origY + dragInfo.origH / 2;
@@ -897,12 +973,14 @@ canvas.addEventListener('mousemove', (e) => {
         if (h.includes('l')) { nw -= ldx; nox = ldx; }
         if (h.includes('b')) { nh += ldy; }
         if (h.includes('t')) { nh -= ldy; noy = ldy; }
-        // Enforce aspect ratio
-        const aspect = getAspect();
-        if (aspect) {
-            if (h === 'ml' || h === 'mr') { nh = nw / aspect; }
-            else if (h === 'tm' || h === 'bm') { nw = nh * aspect; }
-            else { nh = nw / aspect; }
+        // Enforce aspect ratio (frame selections only -- rebate is freeform)
+        if (dragInfo.target !== 'rebate') {
+            const aspect = getAspect();
+            if (aspect) {
+                if (h === 'ml' || h === 'mr') { nh = nw / aspect; }
+                else if (h === 'tm' || h === 'bm') { nw = nh * aspect; }
+                else { nh = nw / aspect; }
+            }
         }
         nw = Math.max(nw, 20); nh = Math.max(nh, 20);
         // Adjust position for the offset (rotate back)
@@ -912,7 +990,7 @@ canvas.addEventListener('mousemove', (e) => {
         s.w = nw; s.h = nh;
         render(); updateSelList();
     } else if (mode === 'rotating' && dragInfo) {
-        const s = selections[activeIdx];
+        const s = dragInfo.target === 'rebate' ? rebateRect : selections[activeIdx];
         const angle = Math.atan2(my - dragInfo.cy, mx - dragInfo.cx);
         s.angle = dragInfo.origAngle + (angle - dragInfo.startAngle);
         render();
@@ -929,32 +1007,42 @@ canvas.addEventListener('mousemove', (e) => {
     }
 });
 
+function sendRebateToServer() {
+    if (!rebateRect) return;
+    fetch('/rebate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            x: rebateRect.x / previewScale,
+            y: rebateRect.y / previewScale,
+            w: rebateRect.w / previewScale,
+            h: rebateRect.h / previewScale,
+            angle: rebateRect.angle || 0,
+        }),
+    }).then(r => r.json()).then(data => {
+        updateDminDisplay(data.dmin || null);
+        refreshInversionPreview();
+    });
+}
+
 canvas.addEventListener('mouseup', () => {
     if (mode === 'drawing_rebate') {
         if (rebateRect && rebateRect.w > 5 && rebateRect.h > 5) {
             statusEl.textContent = `Rebate set (${Math.round(rebateRect.w)}x${Math.round(rebateRect.h)} px)`;
-            // Send to server
-            fetch('/rebate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    x: rebateRect.x / previewScale,
-                    y: rebateRect.y / previewScale,
-                    w: rebateRect.w / previewScale,
-                    h: rebateRect.h / previewScale,
-                }),
-            }).then(r => r.json()).then(data => {
-                updateDminDisplay(data.dmin || null);
-                refreshInversionPreview();
-            });
+            sendRebateToServer();
         } else {
             rebateRect = null;
+            rebateActive = false;
             statusEl.textContent = 'Rebate selection too small, cleared';
         }
         mode = 'idle'; drawStart = null;
         render();
         return;
     }
+    // If we just finished editing the rebate (move/resize/rotate),
+    // recompute Dmin from the new region.
+    const wasRebateEdit = dragInfo && dragInfo.target === 'rebate' &&
+        (mode === 'moving' || mode === 'resizing' || mode === 'rotating');
     if (mode === 'drawing' && activeIdx >= 0 && selections[activeIdx]._temp) {
         const s = selections[activeIdx];
         delete s._temp;
@@ -971,6 +1059,7 @@ canvas.addEventListener('mouseup', () => {
         lastH = s.h;
     }
     mode = 'idle'; dragInfo = null; drawStart = null;
+    if (wasRebateEdit) sendRebateToServer();
     render();
 });
 
@@ -1103,6 +1192,20 @@ async function runAutoDetect() {
                     }
                 }
                 aspectSelect.value = bestErr < 0.05 ? bestOpt : 'free';
+            }
+            // If auto-detect produced a suggested rebate (one of the
+            // inter-frame gaps), set it and recompute Dmin from it.
+            if (data.rebate) {
+                const rb = data.rebate;
+                rebateRect = {
+                    x: rb.cx - rb.w / 2,
+                    y: rb.cy - rb.h / 2,
+                    w: rb.w,
+                    h: rb.h,
+                    angle: rb.angle,
+                };
+                rebateActive = false;
+                sendRebateToServer();
             }
             updateSelList();
             render();
